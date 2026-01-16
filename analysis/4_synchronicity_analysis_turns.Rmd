@@ -1,0 +1,1723 @@
+---
+title: "synchronicity_analysis_turns"
+author: "Moana"
+date: "2025-11-20"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(mgcv)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(purrr)
+library(mgcv)
+
+
+cond_cols <- c(
+  "NC1" = "#87CEEB", 
+  "NC2" = "#7570b3",  
+  "NS"  = "#FFFFAA"  
+)
+
+DATA_ROOT <- "/Users/moanason/Downloads/Data_ANA"
+
+info <- read_csv(file.path(DATA_ROOT, "participant_info.csv")) %>%
+  mutate(
+    dyad = as.factor(str_remove(s_id, "^s")),
+    pair_sx = factor(pair_sx, levels = c("FF", "FM", "MM"))
+  ) %>%
+  dplyr::select(dyad, pair_sx)
+
+sr_sync <- read_csv(file.path(DATA_ROOT, "turn_sync_pairs_with_F0_RMS.csv"))
+
+# Recode dyad and condition
+sr_sync <- sr_sync %>%
+  mutate(
+    dyad = factor(i),
+    condition = factor(
+      c,
+      levels = c(0, 1, 2),         
+      labels = c("NC1", "NC2", "NS")
+    ),
+    # logM = log(M_rate + 1e-6)  # avoid log(0), apply only when the value is huge
+  ) %>%
+  left_join(info, by = "dyad")
+
+frame_df <- read_csv(file.path(DATA_ROOT, "temporal_processed_data_frames.csv"))
+
+frame_df <- frame_df %>%
+  mutate(
+    dyad = factor(id),
+    condition = factor(
+      cond,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    ),
+    # only keep F0/RMS when speaker is active
+    F0_A_sp  = if_else(spk1 == 1, F0_A,  NA_real_),
+    F0_B_sp  = if_else(spk2 == 1, F0_B,  NA_real_),
+    RMS_A_sp = if_else(spk1 == 1, RMS_A, NA_real_),
+    RMS_B_sp = if_else(spk2 == 1, RMS_B, NA_real_)
+  ) %>%
+  left_join(info, by = "dyad")
+
+sr_sync %>% head()
+```
+
+# i) global convergence analysis
+## first, global similarity & convergence over the three features
+### mean mismatch per dyad & condition for speech rate
+```{r}
+sr_sync_summary <- sr_sync %>%
+  group_by(dyad, condition) %>%
+  summarise(
+    n_pairs  = n(),
+    mean_M   = mean(M_rate, na.rm = TRUE),
+    median_M = median(M_rate, na.rm = TRUE),
+    mean_Delta   = mean(Delta_rate, na.rm = TRUE),
+    median_Delta = median(Delta_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sr_sync_summary
+
+```
+
+
+```{r}
+ggplot(sr_sync_summary, aes(x = condition, y = mean_M, colour = condition)) +
+  geom_boxplot() +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    y = "Mean speech-rate mismatch |Delta| (syll/s)",
+    x = "Condition"
+  )
+```
+### mixed model for speech rate (M_rate = speech rate deviation each turn-pair)
+```{r}
+sr_nc <- sr_sync %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+m_sr_mean <- lmer(
+  Delta_rate ~ condition + (1 | dyad),
+  data = sr_nc
+)
+
+summary(m_sr_mean)
+anova(m_sr_mean)
+
+```
+
+
+### global prosodic features analysis 
+```{r}
+sync_df <- read_csv(file.path(DATA_ROOT, "turn_sync_pairs_with_F0_RMS.csv"))
+
+sync_df <- sync_df %>%
+  mutate(
+    dyad = factor(i),
+    condition = factor(
+      c,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    ),
+    # avoid log(0)
+    logF0dev  = log(F0_dev  + 1e-6), # optional
+    logRMSdev = log(RMS_dev + 1e-6),
+    logMrate  = log(M_rate  + 1e-6)
+  ) %>%
+  left_join(info, by = "dyad")
+  # With logM, big mismatches are compressed; this can reduce apparent differences if our main condition effect sits in the “large-mismatch” tail,
+  # but we can stick with M_rate, F0_dev and RMS_dev, large values have full weight.
+
+
+# if only nc
+sync_nc <- sync_df %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+```
+
+### global f0 deviation 
+```{r global F0 deviation} 
+m_f0 <- lmer( # higher deviation, less synchrony
+  F0_dev ~ condition + (1 | dyad),
+  data = sync_nc %>% filter(!is.na(F0_dev))
+)
+
+summary(m_f0)
+anova(m_f0)
+
+```
+
+### global RMS deviation
+```{r global RMS deviation}
+m_rms <- lmer( # higher deviation, less synchrony
+  RMS_dev ~ condition + (1 | dyad),
+  data = sync_nc %>% filter(!is.na(RMS_dev))
+)
+
+summary(m_rms)
+anova(m_rms)
+
+```
+
+
+## then, global (Half-Half) similarity & convergence 
+
+```{r}
+# add half label, define the first half and the second half by the median time_sec
+frame_half <- frame_df %>%
+  group_by(dyad, condition) %>%
+  mutate(
+    half = if_else(time_sec <= median(time_sec, na.rm = TRUE), "H1", "H2")
+  ) %>%
+  ungroup()
+
+# compute
+global_by_half <- frame_half %>%
+  group_by(dyad, condition, half) %>%
+  summarise(
+    F0_A_mean  = mean(F0_A_sp,  na.rm = TRUE),
+    F0_B_mean  = mean(F0_B_sp,  na.rm = TRUE),
+    RMS_A_mean = mean(RMS_A_sp, na.rm = TRUE),
+    RMS_B_mean = mean(RMS_B_sp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+global_by_half
+```
+
+
+```{r}
+# reshape per dyad condition
+global_wide <- global_by_half %>%
+  pivot_wider(
+    id_cols = c(dyad, condition),
+    names_from = half,
+    values_from = c(F0_A_mean, F0_B_mean, RMS_A_mean, RMS_B_mean)
+  )
+
+# Global similarity (absolute difference) and convergence (H1 diff - H2 diff)
+global_metrics <- global_wide %>%
+  mutate(
+    # similarity: smaller diff = more entrained
+    F0_diff_H1  = abs(F0_A_mean_H1  - F0_B_mean_H1),
+    F0_diff_H2  = abs(F0_A_mean_H2  - F0_B_mean_H2),
+    RMS_diff_H1 = abs(RMS_A_mean_H1 - RMS_B_mean_H1),
+    RMS_diff_H2 = abs(RMS_A_mean_H2 - RMS_B_mean_H2),
+
+    F0_convergence  = F0_diff_H1  - F0_diff_H2,
+    RMS_convergence = RMS_diff_H1 - RMS_diff_H2
+  )
+
+global_metrics
+
+```
+
+# mixed models for global (Half-Half) similarity / convergence
+```{r}
+# Global similarity (take whole convo average of diff)
+global_sim <- global_metrics %>%
+  mutate(
+    F0_diff_mean  = (F0_diff_H1  + F0_diff_H2) / 2,
+    RMS_diff_mean = (RMS_diff_H1 + RMS_diff_H2) / 2
+  )
+
+m_F0_sim <- lmer(F0_diff_mean ~ condition + (1 | dyad), data = global_sim)
+summary(m_F0_sim)
+anova(m_F0_sim)
+
+m_RMS_sim <- lmer(RMS_diff_mean ~ condition + (1 | dyad), data = global_sim)
+summary(m_RMS_sim)
+anova(m_RMS_sim)
+
+# convergence
+m_F0_conv <- lmer(F0_convergence ~ condition + (1 | dyad), data = global_metrics)
+summary(m_F0_conv)
+anova(m_F0_conv)
+
+m_RMS_conv <- lmer(RMS_convergence ~ condition + (1 | dyad), data = global_metrics)
+summary(m_RMS_conv)
+anova(m_RMS_conv)
+
+```
+
+
+
+
+
+# ii) Local convergence: Time-resolved synchrony: GAM on |Delta(n)| over time
+
+```{r}
+DATA_ROOT <- "/Users/moanason/Downloads/Data_ANA"
+
+sr_sync <- read_csv(file.path(DATA_ROOT, "turn_sync_pairs_with_F0_RMS.csv"))
+
+sr_sync <- sr_sync %>%
+  mutate(
+    dyad = factor(i),
+    condition = factor(
+      c,
+      levels = c(0, 1, 2),              # adjust if NS not present yet
+      labels = c("NC1", "NC2", "NS")
+    ),
+    # small epsilon to avoid log(0)
+    logM = log(M_rate + 1e-6)
+  ) %>%
+  left_join(info, by = "dyad")
+
+sr_sync <- sr_sync %>%
+  group_by(dyad, condition) %>%
+  mutate(
+    # ensure pair_idx is 0..K-1 within each conversation
+    pair_idx = row_number() - 1,
+    t_rel_idx = pair_idx / max(pair_idx)   # 0 .. 1 (relative index)
+  ) %>%
+  ungroup()
+
+
+sync_nc <- sr_sync %>% # considering the time
+  group_by(dyad, condition) %>%
+  arrange(pair_idx, .by_group = TRUE) %>%
+  mutate(
+    pair_dur = D + D_next,                 # duration represented by this pair
+    t_cum_end = cumsum(pair_dur),          # elapsed time (end of this pair)
+    t_cum_mid = t_cum_end - pair_dur/2,    # elapsed time (midpoint of this pair)
+    t_rel = t_cum_mid / max(t_cum_mid, na.rm = TRUE)  # 0–1 within dyadxcondition
+  ) %>%
+  ungroup()
+
+
+sr_nc %>% head()
+
+```
+
+## Time-resolved speechrate synchrony, turn-by-turn (turn-pair)
+```{r}
+# local convergence (does that difference shrink over successive switches?): Cn​=P_n​−P_n+1​, P_n on conversation progress (t_rel_idx); a negative slope indicates convergence: deviation down, interlocutor coupling up
+gam_sr_rel <- gam(
+    M_rate ~ condition +
+    s(t_rel, by = condition, k = 40) + 
+      s(dyad, bs = "re"),
+  data = sync_nc,
+  method = "REML",
+  weights = pair_dur, 
+  family = Gamma(link = "log")
+)
+
+summary(gam_sr_rel)
+plot(gam_sr_rel, pages = 1, shade = TRUE)
+
+```
+
+```{r from stackoverflow}
+library(ggplot2)
+library(dplyr)
+library(mgcv)
+
+# We generate a sequence of time points for every condition
+new_data <- expand.grid(
+  t_rel = seq(min(sync_nc$t_rel), max(sync_nc$t_rel), length.out = 200),
+  condition = unique(sr_nc$condition),
+  # We need to include 'dyad' to satisfy the model object, 
+  # but we will exclude its effect in the prediction step.
+  dyad = sync_nc$dyad[1] 
+)
+
+# 2. Predict Values (Excluding Random Effects)
+# We use exclude = "s(dyad)" so we predict for an "average" dyad
+pred <- predict(
+  gam_sr_rel, 
+  newdata = new_data, 
+  se.fit = TRUE, 
+  type = "link",         # Predictions on the link scale
+  exclude = "s(dyad)"    # CRITICAL: Ignore the random effect
+)
+
+# 3. Add predictions and CI to the new_data frame
+new_data <- new_data %>%
+  mutate(
+    fit = pred$fit,
+    se = pred$se.fit,
+    # Calculate 95% Confidence Intervals
+    lower = fit - 1.96 * se,
+    upper = fit + 1.96 * se
+  )
+
+ggplot(new_data, aes(x = t_rel, y = fit, color = condition, fill = condition)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1) +
+  # Aesthetic Customization
+  # scale_color_brewer(palette = "Dark2") + # Elegant color palette
+  # scale_fill_brewer(palette = "Dark2") +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    x = "Relative Time Index",
+    y = "Predicted M_rate",
+    title = "Modelled Rate by Condition",
+    subtitle = "GAM prediction excluding random dyadic effects"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+
+```{r fig.width=6, fig.height=4}
+# e.g. 20 bins across the conversation for dynamic change over time (turn-by-turn)
+sr_bins <- sync_nc %>%
+  mutate(
+    bin = cut(
+      t_rel,
+      breaks = seq(0, 1, length.out = 21),
+      include.lowest = TRUE,
+      labels = FALSE
+    )
+  ) %>%
+  mutate(
+    M_rate = -M_rate,
+  ) %>%
+  group_by(condition, bin) %>%
+  summarise(
+    M_mean = mean(M_rate, na.rm = TRUE),
+    M_se   = sd(M_rate, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    bin_center = (bin - 0.5) / 20   # 0.1, 0.3, 0.5, 0.7, 0.9
+  )
+
+ggplot(sr_bins,
+       aes(x = bin_center, y = M_mean, colour = condition, group = condition)) +
+  geom_line(linewidth = 0.5, alpha = 0.7) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  # geom_smooth(stat = "smooth",
+  # position = "identity", se = F, linewidth = 0.7) +
+  geom_errorbar(aes(ymin = M_mean - M_se, ymax = M_mean + M_se), width = 0.01, alpha = 0.2) +
+  labs(
+    x = "Conversation progress (0 ~ 1)",
+    y = "Mean SR mismatch -|Delta| (syl/s): -|Delta|0 = more sync",
+    colour = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("mean_sr_dev.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+
+```
+
+## Time-resolved F0 / RMS synchrony (GAM over progress), local convergence - dynamics
+```{r}
+gam_f0 <- gam(
+  F0_rate ~ condition +
+    s(t_rel, by = condition, k = 40) +
+    s(dyad, bs = "re"),
+  data = sync_nc %>% filter(!is.na(F0_rate)),
+  method = "REML",
+  weights = pair_dur,
+  family = "Gamma"(link = "log")
+)
+
+summary(gam_f0)
+plot(gam_f0, pages = 1, shade = TRUE)
+
+```
+
+
+```{r}
+gam_rms <- gam(
+  RMS_rate ~ condition +
+    s(t_rel, by = condition, k = 6) +
+    s(dyad, bs = "re"),
+  data = sync_nc %>% filter(!is.na(RMS_rate)),
+  method = "REML",
+  weights = pair_dur,
+  family = "Gamma"(link = "log")
+)
+
+summary(gam_rms)
+plot(gam_rms, pages = 1, shade = TRUE)
+
+```
+
+
+```{r}
+# 20 bins across progress
+f0_bins <- sync_nc %>%
+  filter(!is.na(F0_rate)) %>%
+  mutate(
+    bin = cut(t_rel,
+              breaks = seq(0, 1, length.out = 21),
+              include.lowest = TRUE,
+              labels = FALSE)
+  ) %>%
+  group_by(condition, bin) %>%
+  summarise(
+    F0_mean = mean(F0_rate, na.rm = TRUE),
+    F0_se   = sd(F0_rate, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    bin_center = (bin - 0.5) / 5
+  )
+
+ggplot(f0_bins, # visualisation for f0
+       aes(x = bin_center, y = F0_mean, colour = condition, group = condition)) +
+  geom_line(size = 0.5) +
+  geom_point() +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  geom_errorbar(aes(ymin = F0_mean - F0_se,
+                    ymax = F0_mean + F0_se),
+                width = 0.02) +
+  labs(
+    x = "Conversation progress (0 = early, 1 = late)",
+    y = "Mean F0 mismatch |Delta_F0| (z units)",
+    colour = "Condition"
+  )
+
+```
+
+
+### plot a joint plot for gamm --- time-resolved local deviation of the three features
+```{r fig.height=4, fig.width=12} 
+library(ggplot2)
+library(dplyr)
+library(mgcv)
+
+
+cond_cols <- c(
+  "NC1" = "#87CEEB", 
+  "NC2" = "#7570b3",  
+  "NS"  = "#FFFFAA"  
+)
+
+get_gam_pred <- function(model, original_data, metric_label) {
+  
+  # create grid based on specific data range of the model
+  new_data <- expand.grid(
+    t_rel = seq(min(original_data$t_rel), max(original_data$t_rel), length.out = 200),
+    condition = unique(original_data$condition),
+    dyad = original_data$dyad[1] # dummy selection for random effect structure
+  )
+  
+  # predict excluding random effects
+  pred <- predict(model, newdata = new_data, se.fit = TRUE, exclude = "s(dyad)")
+  
+  # return processed frame
+  new_data %>%
+    mutate(
+      fit = pred$fit,
+      se = pred$se.fit,
+      lower = fit - 1.96 * se,
+      upper = fit + 1.96 * se,
+      metric = metric_label # adds a label to distinguish plots
+    )
+}
+
+pred_sr <- get_gam_pred(gam_sr_rel, sync_nc, "SR deviation")
+pred_f0 <- get_gam_pred(gam_f0, sync_nc %>% filter(!is.na(F0_rate)), "F0 deviation")
+pred_rms <- get_gam_pred(gam_rms, sync_nc %>% filter(!is.na(F0_rate)), "RMS deviation") # assuming same filter as provided
+
+plot_data <- bind_rows(pred_sr, pred_f0, pred_rms)
+
+ggplot(plot_data, aes(x = t_rel, y = fit, color = condition, fill = condition)) +
+  # confidence bands
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3, color = NA) +
+  
+  # fitted lines
+  geom_line(linewidth = 0.5) +
+  
+  # aesthetics
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  
+  # facetting: creates separate panels for each metric
+  # scales = "free_y" allows each metric to have its own y-axis range
+  facet_wrap(~ metric, scales = "free_y", nrow = 1) +
+  
+  labs(
+    x = "Relative time index (scale 0 ~ 1)",
+    y = "Predicted value",
+    title = "Interlocutor coupling by condition over time",
+    # subtitle = "gam estimates excluding random dyadic effects"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 12), # bold facet labels
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("GAM_fit_group_matrix.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+
+# iii) frame-wise time-series dataset
+### dynamic synchrony: sliding-window correlations (F0 & RMS)
+```{r}
+# to z-transform by group
+z_by_group <- function(x) {
+  mu <- mean(x, na.rm = TRUE)
+  sd <- sd(x, na.rm = TRUE)
+  if (sd == 0 || is.na(sd)) return(rep(NA_real_, length(x)))
+  (x - mu) / sd
+}
+
+frame_z <- frame_df %>%
+  group_by(dyad, condition) %>%
+  mutate(
+    F0_A_z  = z_by_group(F0_A_sp),
+    F0_B_z  = z_by_group(F0_B_sp),
+    RMS_A_z = z_by_group(RMS_A_sp),
+    RMS_B_z = z_by_group(RMS_B_sp)
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+WIN_LEN  <- 30   # 30-second windows
+STEP_SEC <- 5    # slide every 5 seconds
+
+library(purrr)
+
+compute_window_corr <- function(df, featureA, featureB,
+                                win_len = WIN_LEN, step = STEP_SEC) {
+  # df must contain time_sec and the two features
+  t_min <- min(df$time_sec, na.rm = TRUE)
+  t_max <- max(df$time_sec, na.rm = TRUE)
+  if (!is.finite(t_min) || !is.finite(t_max) || (t_max - t_min) < win_len) {
+    return(tibble())
+  }
+
+  centers <- seq(t_min + win_len / 2, t_max - win_len / 2, by = step)
+
+  map_dfr(centers, function(cc) {
+    t0 <- cc - win_len / 2
+    t1 <- cc + win_len / 2
+    sub <- df %>% filter(time_sec >= t0, time_sec < t1)
+
+    if (nrow(sub) < 10) {
+      r_val <- NA_real_
+    } else {
+      r_val <- suppressWarnings(
+        cor(sub[[featureA]], sub[[featureB]], use = "pairwise.complete.obs")
+      )
+    }
+
+    tibble(
+      win_center = cc,
+      r = r_val
+    )
+  })
+}
+```
+
+
+```{r}
+# F0 synchrony
+sw_F0 <- frame_z %>%
+  group_by(dyad, condition) %>%
+  group_modify(~ compute_window_corr(.x, "F0_A_z", "F0_B_z",
+                                     win_len = WIN_LEN, step = STEP_SEC)) %>%
+  ungroup() %>%
+  mutate(feature = "F0")
+
+# RMS synchrony
+sw_RMS <- frame_z %>%
+  group_by(dyad, condition) %>%
+  group_modify(~ compute_window_corr(.x, "RMS_A_z", "RMS_B_z",
+                                     win_len = WIN_LEN, step = STEP_SEC)) %>%
+  ungroup() %>%
+  mutate(feature = "RMS")
+
+sw_all <- bind_rows(sw_F0, sw_RMS)
+
+sw_all %>% head()
+
+```
+
+
+```{r}
+sw_nc <- sw_all %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+ggplot(sw_nc, aes(x = win_center / 60, y = r, colour = condition)) +
+  geom_smooth(method = "loess", se = TRUE) +
+  facet_wrap(~ feature, ncol = 1) +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    x = "Time (minutes, window centre)",
+    y = "Sliding-window correlation (A vs B)",
+    colour = "Condition"
+  )
+```
+
+
+```{r f0}
+sw_F0_nc <- sw_nc %>% filter(feature == "F0") %>% drop_na(r)
+
+gam_F0_sync <- gam(
+  r ~ condition + s(win_center, by = condition, k = 6) + s(dyad, bs = "re"),
+  data = sw_F0_nc,
+  method = "REML"
+)
+
+summary(gam_F0_sync)
+plot(gam_F0_sync, pages = 1, shade = TRUE)
+```
+
+```{r rms}
+sw_RMS_nc <- sw_nc %>% filter(feature == "RMS") %>% drop_na(r)
+
+gam_RMS_sync <- gam(
+  r ~ condition + s(win_center, by = condition, k = 6) + s(dyad, bs = "re"),
+  data = sw_RMS_nc,
+  method = "REML"
+)
+
+summary(gam_RMS_sync)
+plot(gam_RMS_sync, pages = 1, shade = TRUE)
+
+## overall synchrony (average r) differs between NC1 & NC2
+## synchrony increases over time in one condition more than the other
+
+```
+
+```{r fig.height=4, fig.width=8}
+
+get_gam_pred_w <- function(model, original_data, metric_label) {
+  
+  # create grid based on specific data range of the model
+  new_data <- expand.grid(
+    win_center = seq(min(original_data$win_center), max(original_data$win_center)),
+    condition = unique(original_data$condition),
+    dyad = original_data$dyad[1] # dummy selection for random effect structure
+  )
+  
+  # predict excluding random effects
+  pred <- predict(model, newdata = new_data, se.fit = TRUE, exclude = "s(dyad)")
+  
+  # return processed frame
+  new_data %>%
+    mutate(
+      fit = pred$fit,
+      se = pred$se.fit,
+      lower = fit - 1.96 * se,
+      upper = fit + 1.96 * se,
+      metric = metric_label # adds a label to distinguish plots
+    )
+}
+
+
+pred_f0_w <- get_gam_pred_w(gam_F0_sync, sw_F0_nc, "F0 deviation (windowed)")
+pred_rms_w <- get_gam_pred_w(gam_RMS_sync, sw_RMS_nc, "RMS deviation (windowed)") 
+
+plot_data_w <- bind_rows(pred_f0_w, pred_rms_w)
+
+ggplot(plot_data_w, aes(x = win_center, y = fit, color = condition, fill = condition)) +
+  # confidence bands
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3, color = NA) +
+  
+  geom_line(linewidth = 0.5) +
+  
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  
+  facet_wrap(~ metric, scales = "free_y", nrow = 1) +
+  
+  labs(
+    x = "Conversation progress (windowed)",
+    y = "Sliding-window correlation",
+    title = "Interlocutor coupling with sliding windows (30-sec)",
+    # subtitle = "gam estimates excluding random dyadic effects"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 12), # bold facet labels
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("GAM_fit_windowed_matrix.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+# iv) CRQA on RMS envelopes per dyad x condition
+```{r}
+library(crqa)
+
+DS_STEP <- 0.1  #  increase to 100 ms if memory out (i did for 16gb)
+
+rms_ds <- frame_df %>%
+  mutate(
+    bin = floor(time_sec / DS_STEP)
+  ) %>%
+  group_by(dyad, condition, bin) %>%
+  summarise(
+    time_bin = mean(time_sec, na.rm = TRUE),
+    RMS_A_bin = mean(RMS_A_sp, na.rm = TRUE),
+    RMS_B_bin = mean(RMS_B_sp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+z_by_group <- function(x) {
+  mu <- mean(x, na.rm = TRUE)
+  sd <- sd(x, na.rm = TRUE)
+  if (sd == 0 || is.na(sd)) return(rep(NA_real_, length(x)))
+  (x - mu) / sd
+}
+
+rms_ds_z <- rms_ds %>%
+  group_by(dyad, condition) %>%
+  mutate(
+    RMS_A_z = z_by_group(RMS_A_bin),
+    RMS_B_z = z_by_group(RMS_B_bin)
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+rms_ts_ds <- rms_ds_z %>%
+  group_by(dyad, condition) %>%
+  summarise(
+    RMS_A_ts = list(na.omit(RMS_A_z)),
+    RMS_B_ts = list(na.omit(RMS_B_z)),
+    .groups = "drop"
+  )
+
+rms_ts_ds %>% head()
+```
+
+
+```{r}
+compute_crqa_metrics <- function(ts1, ts2,
+                                 delay = 1,
+                                 embed = 2, # parameters (delay, embed, radius, etc.) can be tuned; here’s a starting point for continuous z-scored RMS at 20 ms -> 100ms resolution
+                                 radius = 0.5,
+                                 mindiagline = 2,
+                                 minvertline = 2,
+                                 tw = 0) {
+
+  ts1 <- as.numeric(ts1)
+  ts2 <- as.numeric(ts2)
+
+  # crqa expects no NAs
+  mask <- is.finite(ts1) & is.finite(ts2)
+  ts1 <- ts1[mask]
+  ts2 <- ts2[mask]
+
+  # if too short, return NAs
+  if (length(ts1) < 50 || length(ts2) < 50) {
+    return(tibble(
+      RR = NA_real_, DET = NA_real_, L = NA_real_, Lmax = NA_real_,
+      ENTR = NA_real_, LAM = NA_real_, TT = NA_real_
+    ))
+  }
+
+  res <- crqa(
+    ts1, ts2,
+    delay       = delay,
+    embed       = embed,
+    rescale     = 0,      # already z-scaled
+    radius      = radius,
+    normalize   = 0,
+    mindiagline = mindiagline,
+    minvertline = minvertline,
+    tw          = tw,
+    whiteline   = TRUE,
+    recpt       = FALSE,
+    side        = "both",
+    method      = "crqa"
+  )
+
+  tibble(
+    RR    = res$RR,
+    DET   = res$DET,
+    L     = res$L,
+    Lmax  = res$Lmax,
+    ENTR  = res$ENTR,
+    LAM   = res$LAM,
+    TT    = res$TT
+  )
+}
+
+```
+
+
+```{r}
+library(purrr)
+
+crqa_df <- rms_ts_ds %>%
+   mutate(
+     crqa = map2(RMS_A_ts, RMS_B_ts, ~ compute_crqa_metrics(.x, .y))
+   ) %>%
+   unnest(crqa)
+
+crqa_df
+```
+
+
+```{r}
+crqa_nc <- crqa_df %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+m_DET <- lmer(DET ~ condition + (1 | dyad), data = crqa_nc)
+summary(m_DET)
+anova(m_DET)
+
+m_RR <- lmer(RR ~ condition + (1 | dyad), data = crqa_nc)
+summary(m_RR)
+anova(m_RR)
+
+m_Lmax <- lmer(L ~ condition + (1 | dyad), data = crqa_nc)
+summary(m_Lmax)
+anova(m_Lmax)
+```
+
+```{r fig.width=8, fig.height=5}
+crqa_long <- crqa_nc %>%
+  dplyr::select(condition, DET, RR, L) %>%
+  pivot_longer(
+    cols = c(DET, RR, L),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    condition = factor(condition),
+    metric = factor(
+      metric,
+      levels = c("DET", "RR", "L"),
+      labels = c("DET (Determinism)", "RR (Recurrence rate)", "Lmax (L)")
+    )
+  )
+
+ggplot(crqa_long, aes(x = condition, y = value, colour = condition)) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  facet_wrap(~ metric, ncol = 3, scales = "free_y") +
+  labs(x = "Condition", y = "CRQA metric value", colour = "Condition", fill = "Condition") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+ggsave("crqa_rms_coupling.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+
+```
+
+as NC2 shows higher DET / RR / Lmax than NC1, thus after the synchrony task, the dyads’ RMS envelopes exhibit more structured and stable coupling in their dynamics, as indicated by higher CRQA determinism and recurrence rate.
+
+
+
+--------------------------------------------------------------------------------
+# v) sync level x turn-taking events
+
+```{r}
+library(dplyr)
+library(mclust)
+
+pairs <- sync_nc %>%
+  mutate(row_id = dplyr::row_number())
+
+sync_df <- pairs %>%
+  dplyr::select(row_id, dyad, condition, M_rate, F0_rate, RMS_rate) %>%
+  dplyr::filter(is.finite(M_rate),
+         is.finite(F0_rate),
+         is.finite(RMS_rate))
+
+sync_df <- sync_df %>%
+  mutate(
+    z_rate = as.numeric(scale(M_rate)),   # z-score of M_rate
+    z_F0   = as.numeric(scale(F0_rate)),     # z-score of M_F0
+    z_RMS  = as.numeric(scale(RMS_rate))     # z-score of M_RMS
+  )
+
+w_rate <- 1/3
+w_F0   <- 1/3
+w_RMS  <- 1/3
+
+sync_df <- sync_df %>%
+  mutate(
+    C = w_rate * z_rate +
+        w_F0   * z_F0   +
+        w_RMS  * z_RMS
+  )
+
+
+# build matrix
+X <- sync_df %>%
+  dplyr::select(z_rate, z_F0, z_RMS) %>%
+  as.matrix()
+
+dim(X)
+head(X)
+```
+
+```{r}
+# fit a dummy three level Gaussian, attempt only, not used at the end
+set.seed(123)  # for reproducibility
+
+gmm3 <- Mclust(X, G = 3)  # force G = 3 components
+
+print(gmm3$G)              # should be 3
+print(gmm3$modelName)      # e.g. "VVV" etc.
+table(gmm3$classification) # cluster sizes
+
+sync_df$cluster <- gmm3$classification
+
+cluster_means <- sync_df %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_C = mean(C, na.rm = TRUE),
+    n      = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_C)
+
+cluster_means
+
+labels_by_order <- c("high", "medium", "low")
+
+cluster_map <- cluster_means %>%
+  mutate(sync_level = labels_by_order) %>%
+  dplyr::select(cluster, sync_level)
+
+sync_df <- sync_df %>%
+  left_join(cluster_map, by = "cluster") %>%
+  mutate(
+    sync_level = factor(sync_level,
+                        levels = c("low", "medium", "high"))
+  )
+
+table(sync_df$sync_level)
+
+sr_nc <- pairs %>%
+  left_join(
+    sync_df %>%
+      dplyr::select(row_id, cluster, sync_level),
+    by = "row_id"
+  )
+```
+
+
+
+## sync ~ event (core statistics!)
+```{r}
+event_df <- read_csv("/Users/moanason/Downloads/Data_ANA/descriptive_processed_event_data.csv")
+
+event_df <- event_df %>%
+  mutate(
+    dyad      = factor(i),
+    condition = factor(
+      c,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    ),
+    speaker_factor = case_when(
+      speaker == 0 ~ "A",
+      speaker == 1 ~ "B",
+      TRUE         ~ NA_character_   # for Gap/Silence/Overlap
+    ),
+    speaker_factor = factor(speaker_factor, levels = c("A", "B"))
+  )
+
+sr_nc_macro <- sync_nc %>%
+  dplyr::mutate(
+    macro_start = start_time,
+    macro_end   = end_next
+  )
+
+event_df2 <- event_df %>%
+  dplyr::mutate(
+    event_start = time_sec,
+    event_end   = time_sec + duration,
+    is_gap      = grepl("Gap",        event, ignore.case = TRUE),
+    is_overlap  = grepl("Overlap",    event, ignore.case = TRUE),
+    is_bc       = grepl("Backchannel",event, ignore.case = TRUE)
+  ) %>%
+  dplyr::select(
+    i, c, dyad, condition,
+    event, duration,
+    event_start, event_end,
+    is_gap, is_overlap, is_bc
+  )
+
+macro_event_long <- sr_nc_macro %>%
+  dplyr::select(
+    i, c, dyad, condition,
+    pair_idx,               # pair identifier for the macro-turn pair
+    macro_start, macro_end
+    ) %>%
+  inner_join(
+    event_df2,
+    by = c("i", "c", "dyad", "condition")
+  ) %>%
+  # Keep only events that intersect [macro_start, macro_end)
+  dplyr::filter(
+    event_start < macro_end,
+    event_end   > macro_start
+  ) %>%
+  dplyr::mutate(
+    overlap_start = pmax(macro_start, event_start),
+    overlap_end   = pmin(macro_end,   event_end),
+    overlap_dur   = pmax(0, overlap_end - overlap_start)
+  )
+
+macro_event_summary <- macro_event_long %>%
+  group_by(i, c, dyad, condition, pair_idx) %>%
+  summarise(
+    has_gap      = any(is_gap     & overlap_dur > 0),
+    has_overlap  = any(is_overlap & overlap_dur > 0),
+    macro_gap_dur = sum(overlap_dur[is_gap],     na.rm = TRUE),
+    macro_ovl_dur = sum(overlap_dur[is_overlap], na.rm = TRUE),
+    macro_bc     = sum(overlap_dur[is_bc], na.rm = TRUE),             # total BC time
+    macro_bc_n   = sum(is_bc & overlap_dur > 0, na.rm = TRUE),        # number of BC events
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    macro_trE_dur = macro_gap_dur + macro_ovl_dur,
+    macro_events = case_when(
+      has_gap & has_overlap ~ "Gap+Overlap",
+      has_gap               ~ "Gap",
+      has_overlap           ~ "Overlap",
+      TRUE                  ~ "None"
+    ),
+    macro_events = factor(
+      macro_events,
+      levels = c("None", "Gap", "Overlap", "Gap+Overlap")
+    )
+  ) %>%
+  dplyr::select(
+    i, c, dyad, condition, pair_idx,
+    macro_events,
+    macro_gap_dur, macro_ovl_dur, macro_trE_dur,
+    macro_bc, macro_bc_n
+  )
+
+sr_nc <- sr_nc_macro %>%
+  left_join(macro_event_summary,
+            by = c("i", "c", "dyad", "condition", "pair_idx")) %>%
+  mutate(
+    macro_pair_dur = macro_end - macro_start,
+    macro_gap_dur = replace_na(macro_gap_dur, 0),
+    macro_ovl_dur = replace_na(macro_ovl_dur, 0),
+    macro_trE_dur = replace_na(macro_trE_dur, 0),
+    macro_bc      = replace_na(macro_bc, 0),
+    macro_bc_n    = replace_na(macro_bc_n, 0L),
+
+    macro_trE_prop = if_else(macro_pair_dur > 0,
+                             macro_trE_dur / macro_pair_dur,
+                             NA_real_),
+    macro_bc_prop  = if_else(macro_pair_dur > 0,
+                             macro_bc / macro_pair_dur,
+                             NA_real_),
+    macro_events = forcats::fct_explicit_na(macro_events, na_level = "None")
+  )
+
+
+table(sr_nc$macro_events, sr_nc$condition)
+summary(sr_nc$macro_bc)
+summary(sr_nc$macro_bc_n)
+
+```
+
+
+### delta+events
+
+```{r} 
+# dummy try with sr
+sr_nc <- sr_nc %>%
+  mutate(
+    macro_events = factor(macro_events,
+                          levels = c("None", "Gap", "Overlap", "Gap+Overlap")),
+    condition    = factor(condition),
+    dyad         = factor(dyad)
+  )
+```
+
+
+```{r}
+library(dplyr)
+
+sr_nc_cont <- sr_nc %>%
+  # keep rows that actually have synchrony values
+  filter(!is.na(M_rate), !is.na(F0_rate), !is.na(RMS_rate)) %>%
+  mutate(
+    # z-scores (across all dyads and conditions)
+    z_rate = as.numeric(scale(M_rate)),
+    z_F0   = as.numeric(scale(F0_rate)),
+    z_RMS  = as.numeric(scale(RMS_rate)),
+
+    # composite mismatch index: mean of the three z-scores
+    mismatch_index = (z_rate + z_F0 + z_RMS) / 3,
+
+    # opt: convert to "synchrony" (higher = more synchrony)
+    sync_index = -mismatch_index,
+
+    # make sure factors are coded nicely
+    condition = factor(condition, levels = c("NC1", "NC2")),
+    # macro_events = factor(
+    #   macro_events,
+    #   levels = c("none", "gap_only", "ovl_only", "gap+ovl")
+    # ),
+    dyad = factor(dyad)
+  )
+```
+
+## we fit a full-crossed contrast coding to the LMM (VITAL)
+```{r}
+sr_nc_cont$condition <- factor(sr_nc_cont$condition, levels = c("NC1", "NC2"))
+sr_nc_cont$macro_events <- factor(sr_nc_cont$macro_events, levels = c("None", "Gap", "Overlap", "Gap+Overlap"))
+contrasts(sr_nc_cont$condition) <- contr.sum(2) 
+contrasts(sr_nc_cont$macro_events) <- contr.sum(length(unique(sr_nc_cont$macro_events)))
+colnames(contrasts(sr_nc_cont$condition)) <- levels(sr_nc_cont$condition)[-1]
+colnames(contrasts(sr_nc_cont$macro_events)) <- levels(sr_nc_cont$macro_events)[-1]
+m_sync <- lmer(
+  sync_index ~ condition * macro_events * macro_trE_dur +
+    macro_bc * macro_bc_n + t_rel + pair_sx +
+    (1 + condition | dyad),
+  data = sr_nc_cont
+)
+
+summary(m_sync)
+anova(m_sync)
+```
+
+
+```{r fig.height=4, fig.width=6} 
+library(emmeans)
+emm_sync <- lmer(
+  sync_index ~ condition * macro_events +
+    macro_bc * macro_bc_n + t_rel + pair_sx +
+    (1 + condition | dyad),
+  data = sr_nc_cont
+)
+emm_sync <- emmeans(emm_sync, ~ macro_events | condition) # simple plot
+
+plot(emm_sync)   # quick diagnostic plot
+
+
+cond_cols <- c(
+  "NC1" = "#87CEEB", 
+  "NC2" = "#7570b3",  
+  "NS"  = "#FFFFAA"  
+)
+
+# Publication-style plot
+emm_df <- as.data.frame(emm_sync)
+
+ggplot(emm_df, aes(x = macro_events, y = emmean,
+                   colour = condition, group = condition)) +
+  geom_point(position = position_dodge(width = 0.4), size = 2) +
+  geom_errorbar(
+    aes(ymin = emmean - SE, ymax = emmean + SE),
+    width = 0.15,
+    position = position_dodge(width = 0.4)
+  ) +
+  scale_colour_manual(values = c("NC1" = "#87CEEB", "NC2" = "#7570b3")) +
+  labs(
+    x = "Transitional Events",
+    y = "Synchrony (higher = more synchronous)",
+    colour = "Condition",
+    title = "Effect of Gap/Overlap on Continuous Synchrony"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("events_on_synchrony.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+```{r fig.width=6, fig.height=4}
+sync_bins <- sr_nc_cont %>% # plot the dynamic change of the matrix, same as before a singular factor (e.g., SR)
+  mutate(
+    bin = cut(
+      t_rel,
+      breaks = seq(0, 1, length.out = 21),
+      include.lowest = TRUE,
+      labels = FALSE
+    )
+  ) %>%
+  group_by(condition, bin) %>%
+  summarise(
+    sync_mean = mean(sync_index, na.rm = TRUE),
+    sync_se   = sd(sync_index, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    bin_center = (bin - 0.5) / 20   # 0.1, 0.3, 0.5, 0.7, 0.9
+  )
+
+ggplot(sync_bins,
+       aes(x = bin_center, y = sync_mean, colour = condition, group = condition)) +
+  geom_line(linewidth = 0.5, alpha = 0.7) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  # geom_smooth(stat = "smooth",
+  # position = "identity", se = F, linewidth = 0.7) +
+  geom_errorbar(aes(ymin = sync_mean - sync_se, ymax = sync_mean + sync_se), width = 0.01, alpha = 0.2) +
+  labs(
+    x = "Conversation progress",
+    y = "Mean sync mismatch: z[SR, F0, RMS]",
+    colour = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("mean_sync_dev.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+```{r fig.width=12, fig.height=8}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+long_bins <- sr_nc_cont %>%
+  dplyr::mutate(
+    sync_rate = -z_rate,
+    sync_F0   = -z_F0,
+    sync_RMS  = -z_RMS
+  ) %>%
+  dplyr::select(condition, t_rel, sync_index, sync_rate, sync_F0, sync_RMS) %>%
+  pivot_longer(
+    cols = c(sync_index, sync_rate, sync_F0, sync_RMS),
+    names_to = "metric",
+    values_to = "sync_value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+      levels = c("sync_rate","sync_F0","sync_RMS","sync_index"),
+      labels = c("Speech rate","F0","RMS","C[SR, F0, RMS]")
+    ),
+    bin = cut(t_rel, breaks = seq(0,1,length.out=21), include.lowest=TRUE, labels=FALSE)
+  ) %>%
+  group_by(condition, metric, bin) %>%
+  summarise(
+    sync_mean = mean(sync_value, na.rm = TRUE),
+    sync_se   = sd(sync_value, na.rm = TRUE) / sqrt(sum(!is.na(sync_value))),
+    .groups = "drop"
+  ) %>%
+  mutate(bin_center = (bin - 0.5) / 20)
+
+ggplot(long_bins, aes(x = bin_center, y = sync_mean, colour = condition, group = condition)) +
+  geom_line(linewidth = 0.5, alpha = 0.7) +
+  geom_point(alpha = 0.7) +
+  geom_errorbar(aes(ymin = sync_mean - sync_se, ymax = sync_mean + sync_se),
+                width = 0.01, alpha = 0.2) +
+  scale_color_manual(values = cond_cols) +
+  facet_wrap(~ metric, ncol = 2, scales = "free_y") +
+  labs(x = "Conversation progress (scale 0 ~ 1)", y = "Synchrony level (higher = more synchronous)", colour = "Condition") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("mean_sync_dev.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+
+library(broom)
+library(broom.mixed)
+library(mgcv)
+
+library(performance)
+library(gt)
+library(kableExtra)
+
+```
+
+
+```{r}
+extract_lmm <- function(mod, model_name, analysis, outcome = NA_character_, level = 0.95) {
+
+  fe <- broom.mixed::tidy(
+    mod,
+    effects = "fixed",
+    conf.int = TRUE,
+    conf.level = level,
+    conf.method = "Wald"   # fast; "profile" is slower but sometimes preferred
+  ) %>%
+    mutate(
+      model      = model_name,
+      analysis   = analysis,
+      outcome    = outcome,
+      model_type = "LMM",
+      term_type  = "parametric",
+      stat_name  = "t"
+    )
+
+  fit <- tibble(
+    model      = model_name,
+    analysis   = analysis,
+    outcome    = outcome,
+    model_type = "LMM",
+    n_obs      = nobs(mod),
+    AIC        = AIC(mod),
+    BIC        = BIC(mod),
+    logLik     = as.numeric(logLik(mod))
+  )
+
+  list(term_table = fe, fit_table = fit)
+}
+
+
+# extract_gam <- function(mod, model_name, analysis, outcome = NA_character_) {
+# 
+#   s <- summary(mod)
+
+extract_gam <- function(mod, model_name, analysis, outcome = NA_character_, level = 0.95) {
+
+  s <- summary(mod)
+  alpha <- 1 - level
+  crit  <- qnorm(1 - alpha/2)  # ~1.96 for 95%
+
+  # parametric terms (with CI)
+  ptab <- as.data.frame(s$p.table) %>%
+    tibble::rownames_to_column("term") %>%
+    rename(
+      estimate  = Estimate,
+      std.error = `Std. Error`,
+      statistic = `t value`,
+      p.value   = `Pr(>|t|)`
+    ) %>% 
+    mutate(
+      conf.low  = estimate - crit * std.error,
+      conf.high = estimate + crit * std.error,
+      model      = model_name,
+      analysis   = analysis,
+      outcome    = outcome,
+      model_type = "GAM",
+      term_type  = "parametric",
+      stat_name  = "t"
+    )
+
+  # smooth terms
+  stab <- as.data.frame(s$s.table) %>%
+    tibble::rownames_to_column("term") %>%
+    rename(
+      edf = edf,
+      ref.df = Ref.df,
+      statistic = F,
+      p.value = `p-value`
+    ) %>%
+    mutate(
+      estimate   = NA_real_,
+      std.error  = NA_real_,
+      conf.low   = NA_real_,
+      conf.high  = NA_real_,
+      model      = model_name,
+      analysis   = analysis,
+      outcome    = outcome,
+      model_type = "GAM",
+      term_type  = "smooth",
+      stat_name  = "F"
+    )
+
+  fit <- tibble(
+    model      = model_name,
+    analysis   = analysis,
+    outcome    = outcome,
+    model_type = "GAM",
+    n_obs      = nobs(mod),
+    AIC        = AIC(mod),
+    BIC        = BIC(mod),
+    dev_expl   = s$dev.expl,
+    r_sq_adj   = s$r.sq
+  )
+
+  list(term_table = bind_rows(ptab, stab), fit_table = fit)
+}
+
+
+extract_ttest <- function(tt, model_name, analysis, outcome, level = 0.95) {
+  broom::tidy(tt, conf.int = TRUE, conf.level = level) %>%
+    transmute(
+      model      = model_name,
+      analysis   = analysis,
+      outcome    = outcome,
+      model_type = "t-test",
+      term_type  = "parametric",
+      term       = "NC2 - NC1",
+      estimate   = estimate,
+      std.error  = NA_real_,
+      statistic  = statistic,
+      p.value    = p.value,
+      conf.low   = conf.low,
+      conf.high  = conf.high,
+      stat_name  = "t"
+    )
+}
+
+
+```
+
+
+
+```{r}
+models <- list(
+  # --- Global LMMs ---
+  list(obj = m_sr_mean,   name = "LMM_Global_SR",  analysis = "Global synchrony (LMM)", outcome = "M_rate / devs"),
+  list(obj = m_f0,   name = "LMM_Global_F0",  analysis = "Global synchrony (LMM)", outcome = "F0 / devs"),
+  list(obj = m_rms,   name = "LMM_Global_RMS",  analysis = "Global synchrony (LMM)", outcome = "RMS / devs"),
+  list(obj = m_F0_sim,    name = "LMM_H1H2_F0",    analysis = "Global H1/H2 (LMM)", outcome = "F0 / sims"),
+  list(obj = m_RMS_sim,    name = "LMM_H1H2_RMS",    analysis = "Global H1/H2 (LMM)", outcome = "RMS / sims"),
+  list(obj = m_F0_conv,    name = "LMM_H1H2_F0",    analysis = "Global H1/H2 (LMM)", outcome = "F0 / conv"),
+  list(obj = m_RMS_conv,    name = "LMM_H1H2_RMS",    analysis = "Global H1/H2 (LMM)", outcome = "RMS / conv"),
+
+  # --- GAMMs (sr, f0, rms) ---
+  list(obj = gam_sr_rel,  name = "GAM_SR",      analysis = "Time-resolved synchrony (GAM)", outcome = "M_rate"),
+  list(obj = gam_f0,      name = "GAM_F0",      analysis = "Time-resolved synchrony (GAM)", outcome = "F0_dev"),
+  list(obj = gam_rms,     name = "GAM_RMS",     analysis = "Time-resolved synchrony (GAM)", outcome = "RMS_dev"),
+
+  # --- Sliding-window GAMs (examples) ---
+  list(obj = gam_F0_sync,   name = "GAM_SW_F0",   analysis = "Sliding-window entrainment (GAM)", outcome = "win_cor_F0"),
+  list(obj = gam_RMS_sync,  name = "GAM_SW_RMS",  analysis = "Sliding-window entrainment (GAM)", outcome = "win_cor_RMS"),
+
+  # CRQA
+  list(obj = m_DET,    name = "LMM_CRQA_DET",    analysis = "CRQA analysis on RMS (LMM)", outcome = "DET"),
+  list(obj = m_RR,     name = "LMM_CRQA_RR",    analysis = "CRQA analysis on RMS (LMM)", outcome = "RR"),
+  list(obj = m_Lmax,   name = "LMM_CRQA_Lmax",    analysis = "CRQA analysis on RMS (LMM)", outcome = "Lmax"),
+  
+  # --- Sync Index LMM ---
+  list(obj = m_sync, name = "LMM_SYNC", analysis = "Composite synchrony index (LMM)", outcome = "sync_index")
+)
+```
+
+
+```{r}
+all_terms <- list()
+all_fit   <- list()
+
+for (m in models) {
+  if (inherits(m$obj, "lmerMod")) {
+    out <- extract_lmm(m$obj, m$name, m$analysis, m$outcome)
+  } else if (inherits(m$obj, "gam")) {
+    out <- extract_gam(m$obj, m$name, m$analysis, m$outcome)
+  } else {
+    stop("Unknown model class for: ", m$name)
+  }
+  all_terms[[m$name]] <- out$term_table
+  all_fit[[m$name]]   <- out$fit_table
+}
+
+terms_tbl <- bind_rows(all_terms)
+fit_tbl   <- bind_rows(all_fit)
+```
+
+```{r}
+key_terms <- c(
+  "Intercept",
+  "conditionNC2",
+  "s\\(t_rel", "s\\(t_rel_idx", "s\\(pair_idx", "s\\(t_cum",   # smooth time terms
+  "macro_events", "macro_bc", "macro_bc_n", "macro_trE_dur"    # your event predictors
+)
+
+report_tbl <- terms_tbl %>%
+  mutate(term = as.character(term)) %>%
+  filter(
+    str_detect(term, str_c(key_terms, collapse = "|"))
+  ) %>%
+  mutate(
+    estimate  = round(estimate, 4),
+    std.error = round(std.error, 4),
+    conf.low  = round(conf.low, 3),
+    conf.high = round(conf.high, 3),
+    CI = ifelse(!is.na(conf.low),
+                   paste0("[", conf.low, ", ", conf.high, "]"),
+                   NA_character_),
+    statistic = round(statistic, 3),
+    p.value   = signif(p.value, 3)
+  ) %>%
+  dplyr::select(analysis, model, outcome, model_type, term_type, term,
+         estimate, std.error, CI, -conf.low, -conf.high, stat_name, statistic, p.value)
+
+
+# if (!("conf.low" %in% names(report_tbl))) report_tbl$conf.low  <- NA_real_
+# if (!("conf.high" %in% names(report_tbl))) report_tbl$conf.high <- NA_real_
+
+# report_tbl <- report_tbl %>%
+#   mutate(
+#     conf.low  = round(conf.low, 3),
+#     conf.high = round(conf.high, 3),
+#     CI = ifelse(!is.na(conf.low),
+#                    paste0("[", conf.low, ", ", conf.high, "]"),
+#                    NA_character_)
+#   ) %>%
+#   dplyr::select(-conf.low, -conf.high)
+
+
+report_tbl <- report_tbl %>%
+  mutate(
+    signif = case_when(
+      is.na(p.value)        ~ NA_character_,
+      p.value < 0.001       ~ "***",
+      p.value < 0.01        ~ "**",
+      p.value < 0.05        ~ "*",
+      p.value < 0.1         ~ ".",
+      TRUE                  ~ ""
+    )
+  )
+
+report_tbl %>%
+  dplyr::select(analysis, model, outcome, model_type, term_type, term,
+         estimate, std.error, CI, statistic, p.value, stat_name)
+
+```
+
+```{r}
+gt_table <- report_tbl %>%
+  gt(groupname_col = "analysis") %>%
+  tab_header(title = "Synchrony modelling summary table") %>%
+  cols_label(
+    model = "Model",
+    outcome = "Outcome",
+    model_type = "Type",
+    term_type = "Term class",
+    term = "Term",
+    estimate = "Est.",
+    std.error = "SE",
+    CI = "CI",
+    stat_name = "",
+    statistic = "Stat",
+    p.value = "p",
+  ) %>%
+  fmt_missing(everything(), missing_text = "") %>%
+  # gt::cols_hide(columns = c(conf.low, conf.high)) %>%
+  tab_options(table.width = pct(100))
+
+gt_table
+```
+
+```{r}
+out_path <- "/Users/moanason/Downloads/Data_ANA/synchrony_model_table.tex"
+gtsave(gt_table, filename = out_path)
+```
+
+```{r}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+tab_tex <- report_tbl 
+
+tex_code <- kable(
+  tab_tex,
+  format = "latex",
+  booktabs = TRUE,
+  longtable = TRUE,
+  caption = "Synchrony modelling summary table"
+) %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+
+out_path <- "/Users/moanason/Downloads/Data_ANA/synchrony_model_table.tex"
+writeLines(tex_code, out_path)
+
+out_path
+
+```
+
+
+```{r}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# tab_tex must contain a column called `analysis`
+tab_tex2 <- tab_tex %>%
+  arrange(analysis)   # important: grouping assumes contiguous blocks
+
+# 1) base table
+tex_kbl <- tab_tex2 %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    longtable = TRUE,
+    caption = "Synchrony modelling summary table",
+    escape = FALSE
+  ) %>%
+  kable_styling(latex_options = c("repeat_header"))  # NOTE: hold_position doesn't apply to longtable
+
+# 2) add grouped row blocks
+grp_sizes  <- tab_tex2 %>% dplyr::count(analysis, name = "n") %>% pull(n)
+grp_labels <- tab_tex2 %>% distinct(analysis) %>% pull(analysis)
+
+for (g in seq_along(grp_sizes)) {
+  tex_kbl <- tex_kbl %>%
+    pack_rows(grp_labels[g], start_row = sum(grp_sizes[seq_len(g-1)]) + 1,
+                           end_row   = sum(grp_sizes[seq_len(g)]),
+              bold = TRUE, italic = FALSE)
+}
+
+# 3) save
+out_path <- "/Users/moanason/Downloads/Data_ANA/synchrony_model_table.tex"
+writeLines(tex_kbl, out_path)
+
+out_path
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

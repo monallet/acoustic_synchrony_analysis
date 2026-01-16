@@ -1,0 +1,707 @@
+---
+title: "analysis_transevents"
+author: "Moana"
+date: "2025-11-19"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(glmmTMB)
+```
+
+```{r}
+# Read the event-level data
+event_df <- read_csv("/Users/moanason/Downloads/Data_ANA/descriptive_processed_event_data.csv")
+
+# Basic recoding
+event_df <- event_df %>%
+  mutate(
+    dyad      = factor(i),
+    condition = factor(
+      c,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    ),
+    speaker_factor = case_when(
+      speaker == 0 ~ "A",
+      speaker == 1 ~ "B",
+      TRUE         ~ NA_character_   # for Gap/Silence/Overlap
+    ),
+    speaker_factor = factor(speaker_factor, levels = c("A", "B"))
+  )
+
+names(event_df)
+```
+
+### attempt for distribution (Markov chain)
+
+```{r}
+library(tidyverse)
+
+DATA_ROOT <- "/Users/moanason/Downloads/Data_ANA"
+
+tre_df <- read_csv(file.path(DATA_ROOT, "descriptive_processed_TrE_BET_IPU_data.csv")) %>%
+  dplyr::mutate(
+    dyad = factor(if ("id" %in% names(.)) id else i),
+    condition = factor(
+      if ("cond" %in% names(.)) cond else c,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    )
+  )
+
+```
+
+
+```{r}
+tre_states <- tre_df %>%
+  dplyr::mutate(
+    state = dplyr::case_when(
+      etype == "IPU"         & spk == 0 ~ "IPU_1",
+      etype == "IPU"         & spk == 1 ~ "IPU_2",
+      etype == "Backchannel" & spk == 0 ~ "BC_1",
+      etype == "Backchannel" & spk == 1 ~ "BC_2",
+      etype == "Gap"                      ~ "GAP",
+      etype == "Silence"                  ~ "SIL",
+      etype == "Overlap"                  ~ "OVL",
+      TRUE                                ~ NA_character_
+    )
+  ) %>%
+  dplyr::filter(!is.na(state)) %>%
+  dplyr::arrange(dyad, condition, time_sec) %>%
+  dplyr::group_by(dyad, condition) %>%
+  dplyr::mutate(
+    state_next    = dplyr::lead(state),
+    etype_next    = dplyr::lead(etype),
+    spk_next      = dplyr::lead(spk),
+    duration_next = dplyr::lead(duration)
+  ) %>%
+  dplyr::ungroup()
+
+```
+
+```{r}
+# sum next-event durations by (dyad, condition, state, state_next)
+transition_time <- tre_states %>%
+  dplyr::filter(!is.na(state_next), !is.na(duration_next)) %>%
+  dplyr::group_by(dyad, condition, state, state_next) %>%
+  dplyr::summarise(
+    dur_next = sum(duration_next, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# convert to probabilities: P(next_state | state), time-weighted
+transition_probs <- transition_time %>%
+  dplyr::group_by(dyad, condition, state) %>%
+  dplyr::mutate(
+    dur_total = sum(dur_next, na.rm = TRUE),
+    P = dplyr::if_else(dur_total > 0, dur_next / dur_total, NA_real_)
+  ) %>%
+  dplyr::ungroup()
+
+transition_probs
+
+```
+
+
+```{r}
+# a mean matrix for inspection
+transition_probs_mean <- transition_probs %>%
+  dplyr::group_by(condition, state, state_next) %>%
+  dplyr::summarise(
+    P_mean = mean(P, na.rm = TRUE),
+    P_sd   = sd(P, na.rm = TRUE),
+    n_dyad = dplyr::n(),
+    .groups = "drop"
+  )
+
+transition_probs_mean
+
+# pivot this to wide matrices
+
+transition_probs_mean %>%
+  # dplyr::filter(condition == "NC1") %>%
+  tidyr::pivot_wider(
+    names_from  = state_next,
+    values_from = P_mean
+  )
+
+```
+
+#### category-level conditional probabilities (flexible aggregations)
+
+To generalise P_disrupt / P_continuous idea, we first map each state to coarser categories:
+Prev categories: IPU, BC, GAP, SIL, OVL
+Next categories: same
+
+```{r}
+transition_probs_cat <- transition_probs %>%
+  dplyr::mutate(
+    prev_cat = dplyr::case_when(
+      state %in% c("IPU_1", "IPU_2") ~ "IPU",
+      state %in% c("BC_1", "BC_2")  ~ "BC",
+      state == "GAP"                ~ "GAP",
+      state == "SIL"                ~ "SIL",
+      state == "OVL"                ~ "OVL",
+      TRUE                          ~ NA_character_
+    ),
+    next_cat = dplyr::case_when(
+      state_next %in% c("IPU_1", "IPU_2") ~ "IPU",
+      state_next %in% c("BC_1", "BC_2")  ~ "BC",
+      state_next == "GAP"                ~ "GAP",
+      state_next == "SIL"                ~ "SIL",
+      state_next == "OVL"                ~ "OVL",
+      TRUE                               ~ NA_character_
+    )
+  ) %>%
+  dplyr::filter(!is.na(prev_cat), !is.na(next_cat))
+
+```
+
+
+```{r}
+# recompute time-weighted probabilities on these categories:
+transition_time_cat <- tre_states %>%
+  dplyr::filter(!is.na(state_next), !is.na(duration_next)) %>%
+  dplyr::mutate(
+    prev_cat = dplyr::case_when(
+      state %in% c("IPU_1", "IPU_2") ~ "IPU",
+      state %in% c("BC_1", "BC_2")  ~ "BC",
+      state == "GAP"                ~ "GAP",
+      state == "SIL"                ~ "SIL",
+      state == "OVL"                ~ "OVL",
+      TRUE                          ~ NA_character_
+    ),
+    next_cat = dplyr::case_when(
+      state_next %in% c("IPU_1", "IPU_2") ~ "IPU",
+      state_next %in% c("BC_1", "BC_2")  ~ "BC",
+      state_next == "GAP"                ~ "GAP",
+      state_next == "SIL"                ~ "SIL",
+      state_next == "OVL"                ~ "OVL",
+      TRUE                               ~ NA_character_
+    )
+  ) %>%
+  dplyr::filter(!is.na(prev_cat), !is.na(next_cat))
+
+transition_probs_cat <- transition_time_cat %>%
+  dplyr::group_by(dyad, condition, prev_cat, next_cat) %>%
+  dplyr::summarise(
+    dur_next = sum(duration_next, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::group_by(dyad, condition, prev_cat) %>%
+  dplyr::mutate(
+    dur_total = sum(dur_next, na.rm = TRUE),
+    P = dplyr::if_else(dur_total > 0, dur_next / dur_total, NA_real_)
+  ) %>%
+  dplyr::ungroup()
+
+transition_probs_cat
+
+```
+
+
+```{r}
+# specific P_disrupt and P_continuous
+bcov_probs_time <- transition_time_cat %>%
+  dplyr::filter(prev_cat %in% c("BC", "OVL"),
+                next_cat %in% c("IPU", "SIL", "GAP")) %>%
+  dplyr::group_by(dyad, condition) %>%
+  dplyr::summarise(
+    dur_disrupt = sum(
+      duration_next[next_cat %in% c("SIL", "GAP")],
+      na.rm = TRUE
+    ),
+    dur_continuous = sum(
+      duration_next[next_cat == "IPU"],
+      na.rm = TRUE
+    ),
+    dur_total = dur_disrupt + dur_continuous,
+    P_disrupt = dplyr::if_else(dur_total > 0, dur_disrupt / dur_total, NA_real_),
+    P_continuous = dplyr::if_else(dur_total > 0, dur_continuous / dur_total, NA_real_),
+    .groups = "drop"
+  )
+
+bcov_probs_time
+
+```
+
+
+```{r}
+m_dis <- lmer(P_disrupt ~ condition + (1 | dyad), data = bcov_probs_time)
+summary(m_dis)
+```
+
+
+#### visualisation: state-level heatmap: P(next_state | state)
+```{r fig.width=8, fig.height=5}
+library(tidyverse)
+
+# choose an order for states on the axes
+state_levels <- c("IPU_1", "IPU_2", "BC_1", "BC_2", "GAP", "P", "OVL")
+
+heat_state <- transition_probs %>%
+  # average across dyads
+  group_by(condition, state, state_next) %>%
+  summarise(
+    P_mean = mean(P, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    state = if_else(state == "SIL", "P", as.character(state)),
+    state_next = if_else(state_next == "SIL", "P", as.character(state_next)),
+    state      = factor(state,      levels = state_levels),
+    state_next = factor(state_next, levels = state_levels)
+  )
+
+ggplot(heat_state, aes(x = state_next, y = state, fill = P_mean)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    name = "P(Next | Current)",
+    low  = 'green',
+    high = 'red'
+  ) +
+  facet_wrap(~ condition) +
+  labs(
+    x = "Next state",
+    y = "Current state",
+    title = "Time-weighted 1st-order Transitional Probability (IPUween detailed states)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+ggsave("markov_first_order.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+
+```
+
+```{r}
+heat_core <- heat_state  %>% 
+  dplyr::filter(state %in% c("IPU_1", "IPU_2", "BC_1", "BC_2", "SIL")) %>%
+  dplyr::filter(state_next %in% c("IPU_1", "IPU_2", "BC_1", "BC_2", "SIL"))
+
+```
+
+
+“Time-weighted state–state transition matrices showed that backchannels, overlaps, and gaps almost always flowed back into single-speaker ‘normal’ turns (IPU states), with very low probabilities of prolonged silence or continued overlap. This overall architecture was qualitatively similar in NC1 and NC2, suggesting that the synchrony manipulation did not fundamentally reorganise the local state transition topology.”
+
+#### visualisation: category-level heatmap: IPU / BC / GAP / SIL / OVL
+```{r}
+cat_levels <- c("IPU", "BC", "GAP", "P", "OVL")
+
+heat_cat <- transition_probs_cat %>%
+  group_by(condition, prev_cat, next_cat) %>%
+  summarise(
+    P_mean = mean(P, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    prev_cat = if_else(prev_cat == "SIL", "P", as.character(prev_cat)),
+    next_cat = if_else(next_cat == "SIL", "P", as.character(next_cat)),
+    prev_cat = factor(prev_cat, levels = cat_levels),
+    next_cat = factor(next_cat, levels = cat_levels)
+  )
+
+ggplot(heat_cat, aes(x = next_cat, y = prev_cat, fill = P_mean)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    name = "P(next | current)",
+    low  = "lightgreen",
+    high = "red"
+  ) +
+  facet_wrap(~ condition) +
+  labs(
+    x = "Next category",
+    y = "Current category",
+    title = "Time-weighted Markov landscape (category level)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+```
+
+“At the category level, the Markov landscape was dominated by transitions from backchannels, overlaps, gaps, and silences into normal turns. In both NC1 and NC2, more than ~80–90% of the time immediately following these ‘perturbation’ events was spent in normal speech, indicating a robust tendency of the dyads to re-establish a single-speaker floor.”
+
+
+
+#### network diagram: Markov landscape as a directed graph (optional, we prefer the heatmap)
+```{r}
+library(igraph)
+library(ggraph)
+
+# choose a condition to visualise, or combine
+cond_to_plot <- c("NC1", "NC2")
+
+edges_cond <- transition_probs %>%
+  filter(condition == cond_to_plot) %>%
+  group_by(state, state_next) %>%
+  summarise(
+    P_mean = mean(P, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # optionally drop tiny transitions to avoid clutter
+  filter(!is.na(P_mean), P_mean > 0.01)
+
+# define node set (all states that appear)
+nodes <- tibble(
+  name = union(edges_cond$state, edges_cond$state_next)
+)
+
+g <- graph_from_data_frame(
+  d = edges_cond,
+  vertices = nodes,
+  directed = TRUE
+)
+
+ggraph(g, layout = "circle") +
+  geom_edge_link(
+    aes(width = P_mean, alpha = P_mean),
+    arrow = arrow(length = unit(2, "mm")),
+    end_cap = circle(2, "mm")
+  ) +
+  geom_node_point(size = 3) +
+  geom_node_text(aes(label = name), vjust = 1.8) +
+  scale_edge_width(range = c(0.5, 3)) +
+  scale_edge_alpha(range = c(0.2, 0.9)) +
+  labs(
+    title = paste("Time-weighted Markov network for", cond_to_plot),
+    edge_width = "P(next | current)"
+  ) +
+  theme_void()
+
+```
+
+
+Higthlights: 
+Category-level heatmap (IPU / BC / GAP / SIL / OVL) per condition
+→ global “conversation architecture” in a single figure.
+
+One network diagram (for NC1 or side-by-side NC1 vs NC2)
+→ more intuitive visual for talks/report, showing which transitions dominate.
+
+The nice part: all of these are directly based on the time-weighted transition probabilities we just defined, so they match our Markov model logic exactly.
+
+Interpret (preliminary interpretation, update required): 
+“Graph representation of the time-weighted state transitions in NC1. Node size and edge thickness reflect the probability of transitioning IPUween states. Normal turns (IPU_1 and IPU_2) act as strong attractors: most transitions from gaps, silences, overlaps, and backchannels flow back into IPU states, illustrating the system’s tendency to stabilise into a single-speaker floor.”
+“The synchrony task does not qualitatively change the ‘grammar of turns’ – the local state transitions of the conversation remain stable – but it makes the content of those turns more tightly aligned in terms of tempo and prosody.”
+
+
+
+
+# new attempt second-order HMM
+```{r}
+library(dplyr)
+
+events_ordered <- tre_states %>%
+  arrange(id, condition, time_sec) %>%
+  group_by(id, condition) %>%
+  mutate(
+    dyad       = id,
+    state      = etype,
+    dur        = duration,
+    state_m1   = lag(state, 1),
+    state_m2   = lag(state, 2),
+    state_m3   = lag(state, 3),
+    state_m4   = lag(state, 4),
+    state_p1   = lead(state, 1),
+    state_p2   = lead(state, 2)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# Only rows where we know previous and next
+triples <- events_ordered %>%
+  filter(!is.na(state_m1), !is.na(state_p1))
+
+# Time-weighted counts for 2nd-order transitions
+trans2_counts <- triples %>%
+  group_by(dyad, condition, prev2 = state_m1, prev1 = state, next1 = state_p1) %>%
+  summarise(weight = sum(dur), .groups = "drop")
+
+# Normalise within each (prev2, prev1) context
+trans2_probs <- trans2_counts %>%
+  group_by(dyad, condition, prev2, prev1) %>%
+  mutate(p_next_given_prev = weight / sum(weight)) %>%
+  ungroup()
+
+```
+
+```{r}
+trans2_probs %>%
+  filter(prev2 == "IPU", prev1 == "Backchannel") %>%
+  arrange(desc(p_next_given_prev))
+```
+
+
+```{r}
+trans2_cat <- trans2_probs %>%
+  mutate(
+    prev2_cat = prev2,
+    prev1_cat = prev1,
+    next_cat  = next1,
+    P_tw      = p_next_given_prev
+  ) %>%
+  group_by(dyad, condition, prev2_cat, prev1_cat, next_cat) %>%
+  summarise(
+    P_tw_sum = sum(P_tw), 
+    .groups = "drop"
+  ) %>%
+  # renormalise so that for each (prev2_cat, prev1_cat, dyad, condition)
+  # probabilities sum to 1
+  group_by(dyad, condition, prev2_cat, prev1_cat) %>%
+  mutate(
+    P_norm = P_tw_sum / sum(P_tw_sum)
+  ) %>%
+  ungroup()
+
+trans2_cat_mean <- trans2_cat %>%
+  group_by(condition, prev2_cat, prev1_cat, next_cat) %>%
+  summarise(
+    P_mean  = mean(P_norm, na.rm = TRUE),
+    P_sd    = sd(P_norm, na.rm = TRUE),
+    n_dyads = n_distinct(dyad),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(P_mean))
+
+trans2_cat_mean <- trans2_cat_mean %>%
+  group_by(condition, prev2_cat, prev1_cat) %>%
+  mutate(
+    n_next = n(),
+    maxP   = max(P_mean)       # largest probability in this context
+  ) %>%
+  ungroup() %>%
+  # keep only contexts with at least 2 alternative next states
+  # and avoid exact-1.0 probabilities (numerical safety margin)
+  filter(n_next > 1, maxP < 0.999)
+
+# a list of all probs descending the probability
+trans2_cat_mean
+```
+
+
+
+```{r fig.width=8, fig.height=5}
+# Order next-state categories nicely (adapt if you use other labels)
+state_levels <- c("IPU", "Backchannel", "Gap", "Pause", "Overlap")
+
+trans2_plot_df <- trans2_cat_mean %>%
+  mutate(
+    prev2_cat = if_else(prev2_cat == "Silence", "Pause", as.character(prev2_cat)),
+    prev1_cat = if_else(prev1_cat == "Silence", "Pause", as.character(prev1_cat)),
+    next_cat = if_else(next_cat == "Silence", "Pause", as.character(next_cat)),
+    context = paste(prev2_cat, "-", prev1_cat),
+    # order contexts by their maximum probability so most likely appear on top
+    context = forcats::fct_reorder(context, P_mean, .fun = max, .desc = TRUE),
+    next_cat = factor(next_cat, levels = state_levels)
+  )
+
+ggplot(trans2_plot_df,
+       aes(x = next_cat, y = context, fill = P_mean)) +
+  geom_tile(colour = "white") +
+  facet_wrap(~ condition, nrow = 1) +
+  scale_fill_gradient(
+    low  = "green",
+    high = "red",
+    name = "P(Next | Context)"
+  ) +
+  labs(
+    x = "Next State",
+    y = "Context State (Previous2, Previous1)",
+    title = "Time-resolved 2nd-order Markov Chain"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+ggsave("markov_second_order.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+
+```
+
+
+
+```{r}
+eps <- 1e-4
+# build context id for random intercepts
+trans2_for_lmm <- trans2_cat %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  mutate(
+    context = interaction(prev2_cat, prev1_cat, next_cat, drop = TRUE),
+    # logit transform probabilities with epsilon guard
+    P_clip = pmin(pmax(P_norm, eps), 1 - eps),
+    logit_P = qlogis(P_clip),
+    condition = factor(condition, levels = c("NC1", "NC2"))
+  )
+
+# mixed model: does condition affect logit probability globally?
+m_trans2 <- lmer(
+  logit_P ~ condition + (1 | dyad) + (1 | context),
+  data = trans2_for_lmm
+)
+
+summary(m_trans2)
+```
+
+
+```{r}
+library(tidyverse)
+
+eps <- 1e-4
+
+# Start from dyad-level probs (already collapsed over speakers if you did that)
+# trans2_cat: dyad, condition, prev2_cat, prev1_cat, next_cat, P_norm
+
+trans2_nc <- trans2_cat %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+trans2_wide <- trans2_nc %>%
+  dplyr::select(dyad, condition, prev2_cat, prev1_cat, next_cat, P_norm) %>%
+  pivot_wider(
+    names_from  = condition,
+    values_from = P_norm
+  ) %>%
+  # keep only dyads that have this transition in *both* conditions
+  drop_na(NC1, NC2) %>%
+  mutate(
+    # logit-transform, clipped to avoid 0/1
+    logit_NC1 = qlogis(pmin(pmax(NC1, eps), 1 - eps)),
+    logit_NC2 = qlogis(pmin(pmax(NC2, eps), 1 - eps)),
+    diff_logit = logit_NC2 - logit_NC1   # paired difference per dyad
+  )
+
+trans2_tests <- trans2_wide %>%
+  group_by(prev2_cat, prev1_cat, next_cat) %>%
+  summarise(
+    n_dyads   = n(),
+    mean_NC1  = mean(NC1),
+    mean_NC2  = mean(NC2),
+    mean_diff = mean(diff_logit),
+    sd_diff   = sd(diff_logit),
+    .groups   = "drop"
+  ) %>%
+  filter(n_dyads >= 2, !is.na(sd_diff), sd_diff > 0) %>%
+  mutate(
+    se_diff = sd_diff / sqrt(n_dyads),
+    t       = mean_diff / se_diff,
+    df      = n_dyads - 1,
+    p_value = 2 * pt(-abs(t), df),
+    p_fdr   = p.adjust(p_value, method = "fdr")
+  ) %>%
+  arrange(p_fdr)
+
+trans2_tests
+```
+```{r}
+write.csv(
+  trans2_tests,
+  "/Users/moanason/Downloads/Data_ANA/trans2_tests.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+# only transitions with enough dyads AND some evidence for difference
+significant_transitions <- trans2_tests %>%
+  filter(n_dyads >= 5, p_value < 0.05) %>%
+  dplyr::select(prev2_cat, prev1_cat, next_cat, n_dyads, t, df, p_value)
+significant_transitions
+```
+
+
+
+```{r}
+trans2_tests_tb <- trans2_tests %>%
+  dplyr::select("prev2_cat", "prev1_cat", "next_cat", "n_dyads", "mean_NC1", "mean_NC2", "t", "p_value") %>%
+  transmute(
+    prev2_cat = if_else(prev2_cat == "Silence", "Pause", as.character(prev2_cat)),
+    prev1_cat = if_else(prev1_cat == "Silence", "Pause", as.character(prev1_cat)),
+    next_cat = if_else(next_cat == "Silence", "Pause", as.character(next_cat)),
+    n_dyads = n_dyads,
+    mean_NC1 = mean_NC1,
+    mean_NC2 = mean_NC2,
+    t = t,
+    p_value = p_value
+  )
+
+trans2_tests_tb %>%
+  arrange(p_value) %>%
+  kable(digits = 3,
+        caption = "General Table Second-Order Markov Chain") %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+
+```{r}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+tab_tex <- trans2_tests_tb %>%
+  mutate(
+    t = round(t, 3),
+    mean_NC1 = round(mean_NC1, 3),
+    mean_NC2 = round(mean_NC2, 3),
+    p_value = round(p_value, 3)
+  ) %>%
+  kable(
+    format = "latex",
+    booktabs = TRUE,
+    longtable = TRUE,
+    col.names = c("Prev-2", "Prev-1", "Next", "N", "NC1", "NC2", "t", "p"),
+    caption = "General 2nd-order markov contrasts"
+  ) %>%
+  kable_styling(latex_options = c("hold_position", "repeat_header"))
+
+# write to file
+cat(as.character(tab_tex), file = "2nd_order_transition_table.tex")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

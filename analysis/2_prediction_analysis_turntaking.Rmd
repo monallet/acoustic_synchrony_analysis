@@ -1,0 +1,361 @@
+---
+title: "prediction_analysis_markov_turntaking"
+author: "Moana"
+date: "2025-11-22"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+
+DATA_ROOT <- "/Users/moanason/Downloads/Data_ANA"
+
+
+cond_cols <- c(
+  "NC1" = "#87CEEB", 
+  "NC2" = "#7570b3",  
+  "NS"  = "#FFFFAA"  
+)
+
+
+# ---- Frame-wise data (20 ms frames) ----
+frame_df <- read_csv(file.path(DATA_ROOT, "temporal_processed_data_frames.csv")) %>%
+  mutate(
+    dyad = factor(id),
+    condition = factor(
+      cond,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    )
+  )
+
+# Expect columns something like:
+# id, cond, time_sec, spk1, spk2, F0_A, RMS_A, F0_B, RMS_B, ...
+
+# ---- TrE/BET/IPU data ----
+# IPU = Inter-pausel units (the second-last level of segment of continuous speech from one speaker)
+# BET = Between event turns (the minimal segmentation level where IPUs (one Turn component) were broke by events, mostly backchannels from the other speaker)
+# Silence = also the minimal segmentation level where the Pauses (the other Turn component) were broke by events, mostly backchannels from the other speaker. 
+# Thus: IPU = BET (not necessarily exist)  + BET overlapped with a Backchannel from the other speaker, which doesn't count for the current IPU from the current speaker + BET (not necessarily exist); Pause = Silence (not necessarily exist) + Silence overlapped with a Backchannel from the other speaker, which doesn't count for the current IPU from the current speaker + Silence (not necessarily exist) 
+tre_df <- read_csv(file.path(DATA_ROOT, "descriptive_processed_TrE_BET_IPU_data.csv")) %>%
+  mutate(
+    dyad = factor(id),
+    condition = factor(
+      cond,
+      levels = c(0, 1, 2),
+      labels = c("NC1", "NC2", "NS")
+    )
+  )
+
+# Expect columns:
+# id, cond, etype, event, label, spk, spk1, spk2,
+# n_syl_A, n_syl_B, sr_A, sr_B, sr,
+# F0_A, RMS_A, F0_B, RMS_B, duration, time_sec
+
+```
+
+### Markov chain over joint speech activity (S_0, S_A, S_B, S_AB)
+```{r}
+# define joint state
+# Joint state based on spk1 / spk2:
+#   S_0  = no one speaking
+#   S_A  = only A speaking
+#   S_B  = only B speaking
+#   S_AB = both speaking (overlap)
+
+joint_states <- frame_df %>%
+  mutate(
+    state = case_when(
+      spk1 == 0 & spk2 == 0 ~ "S_0",
+      spk1 == 1 & spk2 == 0 ~ "S_A",
+      spk1 == 0 & spk2 == 1 ~ "S_B",
+      spk1 == 1 & spk2 == 1 ~ "S_AB",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(state)) %>%
+  arrange(dyad, condition, time_sec)
+
+```
+
+
+```{r}
+# build transitions and transition probabilities per dyad × condition
+
+joint_transitions <- joint_states %>%
+  group_by(dyad, condition) %>%
+  arrange(time_sec, .by_group = TRUE) %>%
+  mutate(
+    state_next = lead(state)
+  ) %>%
+  filter(!is.na(state_next)) %>%
+  group_by(dyad, condition, state) %>%
+  dplyr::count(state_next, name = "n") %>%
+  group_by(dyad, condition, state) %>%
+  mutate(
+    p = n / sum(n)  # row-wise normalisation
+  ) %>%
+  ungroup()
+
+joint_transitions %>% head()
+# joint_transitions is a long-format Markov matrix: for each (dyad,condition,state) you have p(state_next | state).
+
+```
+
+```{r}
+joint_transitions %>%
+  dplyr::filter(dyad == "10", condition == "NC1") %>%
+  dplyr::select(state, state_next, p) %>%
+  pivot_wider(names_from = state_next, values_from = p)
+# the full 4×4 matrix for a specific dyad
+```
+
+
+#### derived “turn-taking style” measures per dyad × condition
+```{r}
+joint_style <- joint_transitions %>%
+  group_by(dyad, condition) %>%
+  summarise(
+    p_switch = sum(p[state == "S_A" & state_next == "S_B"]) +
+               sum(p[state == "S_B" & state_next == "S_A"]),
+    p_overlap_onset = sum(p[state == "S_A" & state_next == "S_AB"]) +
+                      sum(p[state == "S_B" & state_next == "S_AB"]),
+    p_gap_after_speech = sum(p[state == "S_A" & state_next == "S_0"]) +
+                         sum(p[state == "S_B" & state_next == "S_0"]),
+    p_stay_speaking = (
+      sum(p[state == "S_A" & state_next == "S_A"]) +
+      sum(p[state == "S_B" & state_next == "S_B"])
+    ) / 2,
+    .groups = "drop"
+  )
+
+joint_style
+
+```
+
+
+```{r}
+joint_style_nc <- joint_style %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+m_switch <- lmer( # probability of smooth floor switch after speech
+  p_switch ~ condition + (1 | dyad),
+  data = joint_style_nc
+)
+summary(m_switch)
+anova(m_switch)
+
+m_stay <- lmer( # probability of smooth floor switch after speech
+  p_stay_speaking ~ condition + (1 | dyad),
+  data = joint_style_nc
+)
+summary(m_stay)
+anova(m_stay)
+
+m_overlap <- lmer( # probability of overlap after one's speech
+  p_overlap_onset ~ condition + (1 | dyad),
+  data = joint_style_nc
+)
+summary(m_overlap)
+anova(m_overlap)
+
+m_gap <- lmer( # probability of going to silence after one's speech
+  p_gap_after_speech ~ condition + (1 | dyad),
+  data = joint_style_nc
+)
+summary(m_gap)
+anova(m_gap)
+```
+
+
+```{r fig.height=5, fig.width=6}
+joint_style_nc %>%
+  pivot_longer(cols = c(p_switch, p_overlap_onset, p_gap_after_speech, p_stay_speaking),
+               names_to = "measure", values_to = "value") %>%
+  mutate(
+    measure = recode(
+      measure,
+      p_switch   = "P(Speaker Switch)",
+      p_overlap_onset   = "P(Overlap | IPU)",
+      p_gap_after_speech  = "P(Gap | IPU)",
+      p_stay_speaking = "P(Speaker Stay (IPUs))"
+    )
+  ) %>%
+  ggplot(aes(x = condition, y = value, fill = condition)) +
+  geom_boxplot(outlier.alpha = 0.7) +
+  geom_point(alpha = 0.3, col = "black") +
+  facet_wrap(~ measure, scales = "free_y") +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    x = "Condition",
+    y = "Probability",
+    fill = "Condition",
+    title = "Turn-taking measures (joint speech states)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("joint_speech_states.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+
+```
+
+
+
+### Markov chain over event labels (T_A, T_B, BC_A, BC_B, GAP, SIL, OVL)
+```{r}
+event_seq <- tre_df %>%
+  mutate(
+    state = case_when(
+      etype == "BET"         & spk == 0 ~ "T_A",
+      etype == "BET"         & spk == 1 ~ "T_B",
+      etype == "Backchannel" & spk == 0 ~ "BC_A",
+      etype == "Backchannel" & spk == 1 ~ "BC_B",
+      etype == "Gap"                     ~ "GAP",
+      etype == "Silence"                 ~ "SIL",
+      etype == "Overlap"                 ~ "OVL",
+      TRUE                               ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(state)) %>%
+  arrange(dyad, condition, time_sec)
+
+event_seq %>% head()
+
+# event-level Markov transitions per dyad × condition
+event_transitions <- event_seq %>%
+  group_by(dyad, condition) %>%
+  arrange(time_sec, .by_group = TRUE) %>%
+  mutate(
+    state_next = lead(state)
+  ) %>%
+  filter(!is.na(state_next)) %>%
+  group_by(dyad, condition, state) %>%
+  dplyr::count(state_next, name = "n") %>%
+  group_by(dyad, condition, state) %>%
+  mutate(
+    p = n / sum(n)
+  ) %>%
+  ungroup()
+
+event_transitions %>% head()
+
+
+# for a specific dyad-condition we can see the full transition matrix
+event_transitions %>%
+  dplyr::filter(dyad == "10", condition == "NC1") %>%
+  dplyr::select(state, state_next, p) %>%
+  pivot_wider(names_from = state_next, values_from = p)
+
+
+```
+
+#### derived measures about backchannels and turn patterns
+p_BC_given_speech: probability that a turn from one speaker is followed by a backchannel from the other. {P(TA​→BCB​)+P(TB​→BCA​)}
+
+p_switch_after_BC: probability that a backchannel is followed by a floor switch (listener takes the turn) {P(BCB​→TB​)+P(BCA​→TA​)}
+
+p_ovl_after_speech: probability that a turn is followed by an overlap {P(TA​→OVL)+P(TB​→OVL)}
+
+```{r}
+event_style <- event_transitions %>%
+  group_by(dyad, condition) %>%
+  summarise(
+    p_BC_given_speech = sum(p[state == "T_A" & state_next == "BC_B"]) +
+                   sum(p[state == "T_B" & state_next == "BC_A"]),
+    p_switch_after_BC = sum(p[state == "BC_B" & state_next == "T_B"]) +
+                        sum(p[state == "BC_A" & state_next == "T_A"]),
+    p_ovl_after_speech = sum(p[state == "T_A" & state_next == "OVL"]) +
+                    sum(p[state == "T_B" & state_next == "OVL"]),
+    .groups = "drop"
+  )
+
+event_style
+
+```
+
+
+```{r}
+event_style_nc <- event_style %>%
+  filter(condition %in% c("NC1", "NC2"))
+
+
+m_BC_given_T <- lmer(
+  p_BC_given_speech ~ condition + (1 | dyad),
+  data = event_style_nc
+)
+summary(m_BC_given_T)
+anova(m_BC_given_T)
+
+m_switch_after_BC <- lmer(
+  p_switch_after_BC ~ condition + (1 | dyad),
+  data = event_style_nc
+)
+summary(m_switch_after_BC)
+anova(m_switch_after_BC)
+
+m_ovl_after_T <- lmer(
+  p_ovl_after_speech ~ condition + (1 | dyad),
+  data = event_style_nc
+)
+summary(m_ovl_after_T)
+anova(m_ovl_after_T)
+
+```
+
+
+```{r fig.width=8, fig.height=4}
+event_style_nc %>%
+  pivot_longer(cols = c(p_BC_given_speech, p_switch_after_BC, p_ovl_after_speech),
+               names_to = "measure", values_to = "value") %>%
+  mutate(
+    measure = recode(
+      measure,
+      p_BC_given_speech   = "P(BC | IPU)",
+      p_switch_after_BC   = "P(Switch | BC)",
+      p_ovl_after_speech  = "P(Overlap | IPU)"
+    )
+  ) %>%
+  ggplot(aes(x = condition, y = value, fill = condition)) +
+  geom_boxplot(outlier.alpha = 0.7) +
+  geom_point(alpha = 0.3) +
+  facet_wrap(~ measure, scales = "free_y") +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    x = "Condition",
+    y = "Probability",
+    fill = "Condition",
+    title = "Conditional Patterns for Overlapping Events (Speech / Backchannels / Overlaps)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("conditional_patterns_for_events.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

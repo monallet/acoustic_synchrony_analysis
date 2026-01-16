@@ -1,0 +1,816 @@
+---
+title: "descriptive_final"
+author: "Moana"
+date: "2025-12-12"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(broom)
+library(knitr)
+library(kableExtra)
+library(tidyr)
+library(purrr)
+library(lme4)
+library(lmerTest)
+library(mgcv)
+
+
+BASE <- "/Users/moanason/Downloads/Data_ANA"
+
+cond_cols <- c(
+  "NC1" = "#87CEEB", 
+  "NC2" = "#7570b3",  
+  "NS"  = "#FFFFAA"  
+)
+
+info <- read_csv(file.path(BASE, "participant_info.csv")) %>%
+  group_by(s_id, pair_sx) %>%
+  mutate(
+    dyad = factor(str_remove(s_id, "^s")),
+    pair_sx = factor(pair_sx, levels = c("FF", "FM", "MM"))
+  ) %>%
+  dplyr::select(dyad, pair_sx)
+
+### event_df
+event_df <- read_csv(
+  "/Users/moanason/Downloads/Data_ANA/descriptive_processed_event_data_with_pause.csv"
+) %>%
+  mutate(
+    dyad      = factor(i),
+    condition = recode_factor(
+      as.integer(c),
+      `0` = "NC1",
+      `1` = "NC2",
+      `2` = "NS"
+    ),
+    event     = as.factor(event)
+  ) %>%
+  left_join(info, by = "dyad")
+
+### event_details
+TrE_BET_df <- read_csv(
+  "/Users/moanason/Downloads/Data_ANA/descriptive_processed_TrE_BET_IPU_data.csv"
+) %>%
+  mutate(
+    dyad      = factor(id),
+    condition = recode_factor(
+      as.integer(cond),
+      `0` = "NC1",
+      `1` = "NC2",
+      `2` = "NS"
+    ),
+    etype = as.factor(etype)
+  ) %>%
+  left_join(info, by = "dyad")
+
+### sync_df
+sr_sync <- read_csv(file.path(BASE, "turn_sync_pairs_with_F0_RMS.csv"))
+sr_sync <- sr_sync %>%
+  mutate(
+    dyad = factor(i),
+    condition = factor(
+      c,
+      levels = c(0, 1, 2),         
+      labels = c("NC1", "NC2", "NS")
+    ),
+  ) %>%
+  left_join(info, by = "dyad")
+
+
+conv_dur <- event_df %>%
+  group_by(dyad, condition) %>%
+  summarise(
+    conv_duration = max(time_sec + duration, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+
+### i 
+i) Duration of each turn-constructive unit: IPU, Turn, Gaps, Backchannels, Overlaps, Silence -- what are the averaged duration of each turn-constructive unit (event) happening during the conversation per dyad, per condition? How do they (gaps and overlaps specifically) differ across different sex pairs?
+
+```{r}
+
+# micro-turns (IPUs) from TrE_BET_df
+ipu_df <- TrE_BET_df %>%
+  filter(etype == "IPU") %>%
+  transmute(
+    dyad, condition,
+    unit     = "IPU",
+    duration = duration
+  )
+
+# other events from event_df
+event_units_df <- event_df %>%
+  filter(event %in% c("Backchannel", "Overlap", "Pause", "Gap")) %>%
+  transmute(
+    dyad, condition,
+    # unit     = if_else(event == "Turn", "IPU", as.character(event)),
+    unit     = as.character(event),
+    duration = duration,
+    pair_sx = pair_sx
+  )
+
+
+macro_unit_df <- sr_sync %>%
+  transmute(
+    dyad, condition,
+    unit     = "Turn", # macro_turn
+    duration = D
+  )
+
+units_df <- bind_rows(ipu_df, macro_unit_df, event_units_df) %>%
+  mutate(
+    unit = factor(unit,
+                  levels = c("Turn", "IPU", "Gap", "Pause", "Overlap", "Backchannel"))
+  )
+
+# per dyad × condition × unit: mean/median duration
+dur_by_dyad <- units_df %>%
+  group_by(dyad, condition, unit, pair_sx) %>%
+  summarise(
+    n_events   = n(),
+    mean_dur   = mean(duration, na.rm = TRUE),
+    median_dur = median(duration, na.rm = TRUE),
+    sd_dur     = sd(duration, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+# overall descriptive table (mean over dyads)
+dur_overall <- dur_by_dyad %>%
+  group_by(condition, unit) %>%
+  summarise(
+    n_dyads      = n(),
+    mean_of_means = mean(mean_dur, na.rm = TRUE),
+    sd_of_means   = sd(mean_dur, na.rm = TRUE),
+    .groups       = "drop"
+  )
+
+# Pretty table
+dur_overall %>%
+  arrange(unit, condition) %>%
+  kable(digits = 3,
+        caption = "Mean duration (s) of turn-constructive units by condition") %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+
+```{r}
+gap_mm <- dur_by_dyad %>%
+  filter(unit == "Gap", condition %in% c("NC1", "NC2"))
+ovl_mm <- dur_by_dyad %>%
+  filter(unit == "Overlap", condition %in% c("NC1", "NC2"))
+pause_mm <- dur_by_dyad %>%
+  filter(unit == "Pause", condition %in% c("NC1", "NC2"))
+m_gap <- lmer(
+  mean_dur ~ condition * pair_sx + (1 | dyad),
+  data = gap_mm
+)
+m_ovl <-lmer(
+  mean_dur ~ condition * pair_sx + (1 | dyad),
+  data = ovl_mm
+)
+m_pause <- lmer(
+  mean_dur ~ condition * pair_sx + (1 | dyad),
+  data = pause_mm
+)
+summary(m_gap)
+summary(m_ovl)
+summary(m_pause)
+```
+
+```{r}
+mean_sum <- pause_mm %>%
+  mutate(pair_sx = as.factor(pair_sx)) %>%
+  group_by(pair_sx) %>%
+  summarise(
+    avg_dur = mean(mean_dur, na.rm = TRUE), # na.rm is safer
+    .groups = "drop"
+  )
+
+mean_sum
+```
+
+
+
+
+
+```{r}
+ipu_mm <- dur_by_dyad %>%
+  filter(unit == "Turn", condition %in% c("NC1", "NC2"))
+m_ipu <- lmer(
+  mean_dur ~ condition + (1 | dyad),
+  data = ipu_mm
+)
+summary(m_ipu)
+```
+
+
+```{r}
+# Source - https://stackoverflow.com/a
+# Posted by jan-glx, modified by community. See post 'Timeline' for change history
+# Retrieved 2025-12-12, License - CC BY-SA 4.0
+
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin, 
+                           draw_group = function(self, data, ..., draw_quantiles = NULL) {
+  data <- transform(data, xminv = x - violinwidth * (x - xmin), xmaxv = x + violinwidth * (xmax - x))
+  grp <- data[1, "group"]
+  newdata <- plyr::arrange(transform(data, x = if (grp %% 2 == 1) xminv else xmaxv), if (grp %% 2 == 1) y else -y)
+  newdata <- rbind(newdata[1, ], newdata, newdata[nrow(newdata), ], newdata[1, ])
+  newdata[c(1, nrow(newdata) - 1, nrow(newdata)), "x"] <- round(newdata[1, "x"])
+
+  if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+    stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <=
+      1))
+    quantiles <- ggplot2:::create_quantile_segment_frame(data, draw_quantiles)
+    aesthetics <- data[rep(1, nrow(quantiles)), setdiff(names(data), c("x", "y")), drop = FALSE]
+    aesthetics$alpha <- rep(1, nrow(quantiles))
+    both <- cbind(quantiles, aesthetics)
+    quantile_grob <- GeomPath$draw_panel(both, ...)
+    ggplot2:::ggname("geom_split_violin", grid::grobTree(GeomPolygon$draw_panel(newdata, ...), quantile_grob))
+  }
+  else {
+    ggplot2:::ggname("geom_split_violin", GeomPolygon$draw_panel(newdata, ...))
+  }
+})
+
+geom_split_violin <- function(mapping = NULL, data = NULL, stat = "ydensity", position = "identity", ..., 
+                              draw_quantiles = NULL, trim = TRUE, scale = "area", na.rm = FALSE, 
+                              show.legend = NA, inherit.aes = TRUE) {
+  layer(data = data, mapping = mapping, stat = stat, geom = GeomSplitViolin, 
+        position = position, show.legend = show.legend, inherit.aes = inherit.aes, 
+        params = list(trim = trim, scale = scale, draw_quantiles = draw_quantiles, na.rm = na.rm, ...))
+}
+```
+
+
+```{r fig.width=8, fig.height=5}
+dur_plot_facet <- dur_by_dyad %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  mutate(dummy = "tray")  # single x-position per facet
+
+ggplot(
+  dur_plot_facet,
+  aes(x = dummy, y = mean_dur, fill = condition)
+) +
+  geom_split_violin(
+    trim          = FALSE,
+    alpha         = 0.7,
+    # colour        = "black",
+    draw_quantiles = c(0.25, 0.75)
+  ) +
+  facet_wrap(~ unit, scales = "free_y") +
+  scale_fill_manual(values = cond_cols[c("NC1", "NC2")]) +
+  labs(
+    x = NULL,
+    y = "Mean Duration per Conversation (s)",
+    fill = "Condition",
+    title = "Mean Duration of IPUs, Turns and Transitional Events"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text   = element_text(size = 12, face = "bold"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("mean_dur_events.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+### ii
+ii) Average sum of IPU and the Turns per dyad per condition -- how many turns are averagely produced in a conversation lasting for 10 minutes? How do they differ between conditions and across different sex pairs?
+
+```{r}
+require(dplyr)
+
+# IPU counts
+ipu_counts <- TrE_BET_df %>%
+  filter(etype == "IPU") %>%
+  mutate(unit = "IPU") %>%
+  group_by(dyad, condition, unit, pair_sx) %>%
+  summarise(n_ipu = n(), .groups = "drop")
+
+# macro-turn counts
+turn_counts <- sr_sync %>%
+  mutate(unit = "Turn") %>%
+  group_by(dyad, condition, unit) %>%
+  summarise(n_turn = n(), .groups = "drop")
+
+# merge with conversation duration and compute per-minute rates
+turns_ipu_summary <- conv_dur %>%
+  left_join(ipu_counts,  by = c("dyad", "condition")) %>%
+  left_join(turn_counts, by = c("dyad", "condition")) %>%
+  mutate(
+    n_ipu  = replace_na(n_ipu, 0L),
+    n_turn = replace_na(n_turn, 0L),
+    minutes = conv_duration / 60,
+    ipu_per_min  = n_ipu  / minutes,
+    turn_per_min = n_turn / minutes
+  )
+
+# descriptive table
+turns_ipu_summary %>%
+  group_by(condition) %>%
+  summarise(
+    mean_ipu_per_min  = mean(ipu_per_min,  na.rm = TRUE),
+    sd_ipu_per_min    = sd(ipu_per_min,    na.rm = TRUE),
+    mean_turn_per_min = mean(turn_per_min, na.rm = TRUE),
+    sd_turn_per_min   = sd(turn_per_min,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 2,
+        caption = "Mean number of IPUs and macro-turns per minute") %>%
+  kable_styling(full_width = FALSE)
+
+turns_ipu_long <- turns_ipu_summary %>%
+  dplyr::select(dyad, condition, ipu_per_min, turn_per_min) %>%
+  pivot_longer(cols = c(ipu_per_min, turn_per_min),
+               names_to = "unit", values_to = "rate_per_min") %>%
+  dplyr::mutate(
+    unit = recode(unit,
+                  "ipu_per_min"  = "IPU",
+                  "turn_per_min" = "Turn")
+  )
+
+# tests
+ipu_test <- lmer(
+  ipu_per_min ~ condition * pair_sx +
+    (1 | dyad),
+  turns_ipu_summary
+)
+
+turn_test <- lmer(
+  turn_per_min ~ condition * pair_sx +
+    (1 | dyad),
+  turns_ipu_summary
+)
+
+summary(ipu_test)
+summary(turn_test)
+
+
+```
+
+```{r fig.width=5, fig.height=3}
+# turns_plot_facet <- turns_ipu_long %>%
+#   filter(condition %in% c("NC1", "NC2")) %>%
+#   mutate(dummy = "tray")
+
+ggplot( 
+  turns_ipu_long %>% filter(condition %in% c("NC1", "NC2")),
+  aes(x = unit, y = rate_per_min, fill = condition)
+) +
+  geom_split_violin(
+    trim          = FALSE,
+    alpha         = 0.7,
+    # colour        = "black",
+    draw_quantiles = c(0.25, 0.75)
+  ) +
+  facet_wrap(~ unit, scales = "free_x") +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    x = NULL,
+    y = "Count per minute",
+    fill = "Condition",
+    title = "Number of IPUs and Turns per minute"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text   = element_text(size = 12, face = "bold"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("count_ipu_turn.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+### iii
+iii) Proportion: N(overlaps|gaps) / N(Transitional Events) -- how are the gaps and overlaps distributed in conversations during floor transfer? How do they differ between conditions and across different sex pairs?
+
+```{r}
+
+# Transitional events (exclude IPUs)
+trans_df <- TrE_BET_df %>%
+  filter(etype != "IPU", etype != "BET", etype != "Silence", etype != "Backchannel") %>%
+  mutate(
+    is_overlap = etype == "Overlap",
+    is_gap     = etype %in% c("Gap")
+  )
+
+trans_summary <- trans_df %>%
+  group_by(dyad, condition, pair_sx) %>%
+  summarise(
+    n_trans   = n(),
+    n_overlap = sum(is_overlap, na.rm = TRUE),
+    n_gap     = sum(is_gap,     na.rm = TRUE),
+    prop_overlap = n_overlap / n_trans,
+    prop_gap     = n_gap     / n_trans,
+    .groups      = "drop"
+  )
+
+trans_summary %>%
+  group_by(condition) %>%
+  summarise(
+    mean_prop_overlap = mean(prop_overlap, na.rm = TRUE),
+    sd_prop_overlap   = sd(prop_overlap,   na.rm = TRUE),
+    mean_prop_gap     = mean(prop_gap,     na.rm = TRUE),
+    sd_prop_gap       = sd(prop_gap,       na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3,
+        caption = "Proportions of overlaps and gaps among transitional events") %>%
+  kable_styling(full_width = FALSE)
+
+# Plot: overlap and gap proportions
+trans_long <- trans_summary %>%
+  dplyr::select(dyad, condition, prop_overlap, prop_gap) %>%
+  pivot_longer(cols = c(prop_overlap, prop_gap),
+               names_to = "type", values_to = "prop") %>%
+  dplyr::mutate(
+    type = recode(type,
+                  "prop_overlap" = "Overlap",
+                  "prop_gap"     = "Gap")
+  )
+```
+
+```{r  fig.height=4, fig.width=6}
+ggplot(
+  trans_long %>% filter(condition %in% c("NC1", "NC2")),
+  aes(x = type, y = prop, fill = condition)
+) +
+  geom_boxplot(
+    position = position_dodge(width = 0.9),
+    alpha = 1.0
+  ) +
+  geom_jitter(
+    aes(),
+    position = position_jitterdodge(
+      jitter.width = 0.12,
+      dodge.width  = 0.75
+    ),
+    alpha = 0.5,
+    size = 1.5
+  ) +
+  scale_color_manual(values = cond_cols) +
+  scale_fill_manual(values = cond_cols) +
+  labs(
+    x = "Transitional Event Type",
+    y = "Proportion of Transitional Events",
+    fill = "Condition",
+    color = "Condition",
+    title = "Distribution of Gaps and Overlaps during Floor Transfer"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("distribution_tre.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+
+
+```{r}
+trans_test_ovlp <- lmer(
+  prop_overlap ~ condition * pair_sx +
+    (1 | dyad), 
+  trans_summary
+)
+trans_test_gap <- lmer(
+  prop_gap ~ condition * pair_sx +
+    (1 | dyad), 
+  trans_summary
+)
+summary(trans_test_ovlp)
+summary(trans_test_gap)
+```
+
+
+### iv)
+iv) Density: N(Backchannels) / Time -- how often are the backchannels produced in a 10-min conversation? 
+
+```{r}
+
+bc_counts <- event_df %>%
+  filter(event == "Backchannel") %>%
+  group_by(dyad, condition, pair_sx) %>%
+  summarise(
+    n_bc   = n(),
+    dur_bc = sum(duration, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bc_summary <- conv_dur %>%
+  left_join(bc_counts, by = c("dyad", "condition")) %>%
+  mutate(
+    n_bc   = replace_na(n_bc,   0L),
+    dur_bc = replace_na(dur_bc, 0),
+    minutes       = conv_duration / 60,
+    bc_per_min    = n_bc / minutes,
+    bc_time_ratio = dur_bc / conv_duration
+  )
+
+bc_summary %>%
+  group_by(condition) %>%
+  summarise(
+    mean_bc_per_min    = mean(bc_per_min,    na.rm = TRUE),
+    sd_bc_per_min      = sd(bc_per_min,      na.rm = TRUE),
+    mean_bc_time_ratio = mean(bc_time_ratio, na.rm = TRUE),
+    sd_bc_time_ratio   = sd(bc_time_ratio,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3,
+        caption = "Backchannel density and time proportion by condition") %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+
+```{r fig.height=4, fig.width=6}
+ggplot(
+  bc_summary %>%
+  aes(x = condition, y = bc_per_min, fill = condition)
+) +
+  geom_boxplot(width = 0.5, colour = "black") +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  scale_fill_manual(values = cond_cols[c("NC1", "NC2")]) +
+  # facet_grid(~ pair_sx) +
+  labs(
+    x = "Condition",
+    y = "Backchannels per minute",
+    fill = "Condition",
+    title = "Frequency of Backchannels in 10-min Conversation"
+  ) +
+  theme_minimal()+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+ggsave("bc_frequency.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
+```{r}
+bc_sx_tests <- lmer(
+  bc_time_ratio ~ condition + pair_sx + 
+    (1 | dyad),
+  bc_summary
+)
+summary(bc_sx_tests)
+```
+
+--------------------------------------------------------------------------------
+# summary of all descriptive results
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+
+tab_duration <- dur_overall %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  transmute(
+    category  = "Duration",
+    measure   = "Mean duration (s)",
+    unit      = as.character(unit),
+    condition = condition,
+    mean      = mean_of_means,
+    sd        = sd_of_means
+  )
+
+tab_turns <- turns_ipu_long %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  group_by(condition, unit) %>%
+  summarise(
+    n_dyads = n_distinct(dyad),
+    mean    = mean(rate_per_min, na.rm = TRUE),
+    sd      = sd(rate_per_min,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    category  = "Turn frequency",
+    measure   = "Count per minute",
+    unit      = unit,
+    condition = condition,
+    mean, sd
+  )
+
+tab_trans <- trans_long %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  group_by(condition, type) %>%
+  summarise(
+    n_dyads = n_distinct(dyad),
+    mean    = mean(prop, na.rm = TRUE),
+    sd      = sd(prop,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    category  = "Transitional distribution",
+    measure   = "Proportion of transitional events",
+    unit      = type,        # "Gap" / "Overlap"
+    condition = condition,
+    mean, sd
+  )
+
+tab_bc_per_min <- bc_summary %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  group_by(condition) %>%
+  summarise(
+    n_dyads = n_distinct(dyad),
+    mean    = mean(bc_per_min,    na.rm = TRUE),
+    sd      = sd(bc_per_min,      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    category  = "Backchannel density",
+    measure   = "Backchannels per minute",
+    unit      = "Backchannel",
+    condition = condition,
+    mean, sd
+  )
+
+tab_bc_time_ratio <- bc_summary %>%
+  filter(condition %in% c("NC1", "NC2")) %>%
+  group_by(condition) %>%
+  summarise(
+    n_dyads = n_distinct(dyad),
+    mean    = mean(bc_time_ratio, na.rm = TRUE),
+    sd      = sd(bc_time_ratio,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    category  = "Backchannel density",
+    measure   = "Proportion of time spent in BC",
+    unit      = "Backchannel",
+    condition = condition,
+    mean, sd
+  )
+
+tab_bc <- bind_rows(tab_bc_per_min, tab_bc_time_ratio)
+
+summary_all <- bind_rows(
+  tab_duration,
+  tab_turns,
+  tab_trans,
+  tab_bc
+) %>%
+  arrange(category, unit, condition)
+
+summary_all %>%
+  kable(digits = 3,
+        col.names = c("Category", "Measure", "Unit",
+                      "Condition", "Mean", "SD"),
+        caption = "Descriptive statistics of turn-taking and backchannel behaviour") %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+```{r}
+write.csv(
+  summary_all,
+  "/Users/moanason/Downloads/Data_ANA/descriptive_summary_table.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+require(gt)
+gt_summary <- summary_all %>%
+  mutate(
+    Mean = round(mean, 3),
+    SD   = round(sd,   3)
+  ) %>%
+  dplyr::select(Category = category,
+         Measure  = measure,
+         Unit     = unit,
+         Condition = condition,
+         Mean, SD) %>%
+  gt(groupname_col = "Category") %>%
+  tab_header(
+    title = "Descriptive statistics of turn-taking and backchannel behaviour"
+  ) %>%
+  fmt_number(columns = c(Mean, SD), decimals = 3) %>%
+  cols_align(align = "left", columns = c(Measure, Unit)) %>%
+  cols_align(align = "center", columns = c(Condition)) %>%
+  cols_align(align = "right", columns = c(Mean, SD)) %>%
+  tab_options(
+    table.width = pct(100),
+    row_group.as_column = FALSE
+  )
+
+gt_summary
+# gtsave(gt_summary, "summary_all_gt.png", path = "/Users/moanason/Downloads/Data_ANA/Tab")
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+
+names(summary_all)
+##    z = (Mean - grand_mean_of_Mean) / sd_of_Mean
+##    for each Category × Measure across all Unit × Condition
+
+summary_z <- summary_all %>%
+  mutate(
+    var_label = paste(category, measure, sep = " – ")
+  ) %>%
+  group_by(var_label) %>%
+  mutate(
+    z_mean = (mean - mean(mean, na.rm = TRUE)) /
+             sd(mean,  na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+summary_z %>%
+  arrange(category, measure, unit, condition) %>%
+  kable(
+    digits = 3,
+    caption = "Standardised (z) descriptive measures across event types"
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+
+
+summary_z <- summary_z %>%
+  mutate(
+    condition = factor(condition, levels = c("NC1", "NC2"))
+  )
+
+unit_levels <- c("Turn", "IPU", "Gap", "Pause", "Overlap", "Backchannel")
+summary_z <- summary_z %>%
+  mutate(
+    unit = factor(unit, levels = unit_levels)
+  )
+
+summary_z <- summary_z %>%
+  mutate(
+    var_label = dplyr::recode(
+      var_label,
+      "Duration – Mean duration (s)"                 = "Duration",
+      "Turn frequency – Count per minute"            = "Turn count / min",
+      "Transitional distribution – Proportion of transitional events" = "Gaps / Overlaps",
+      "Backchannel density – Backchannels per minute" = "BC / minute",
+      "Backchannel density – Proportion of time spent in BC" = "BC time ratio",
+      .default = var_label
+    )
+  )
+```
+
+```{r figure z-scores, fig.height=3, fig.width=10, cache=FALSE}
+ggplot(
+  summary_z %>% 
+    filter(condition %in% c("NC1", "NC2")) %>%
+    filter(!var_label %in% c("BC / minute", "BC time ratio")),
+  aes(x = unit, y = z_mean, fill = condition)
+) +
+  # zero line
+  geom_hline(yintercept = 0, colour = "grey30", size = 0.4) +
+  geom_hline(yintercept =  1, linetype = "dashed", colour = "grey70", size = 0.3) +
+  geom_hline(yintercept = -1, linetype = "dashed", colour = "grey70", size = 0.3) +
+  
+  # grouped bars per Unit, per Condition
+  geom_col(
+    position = position_dodge(width = 1.0),
+    width    = 0.6,
+    colour   = "black"
+  ) +
+  
+  facet_grid(
+    ~ var_label,
+    scales = "free_x",
+    space  = "free_x"
+  ) +
+  
+  scale_fill_manual(values = cond_cols[c("NC1", "NC2")]) +
+  
+  labs(
+    x = NULL,
+    y = "z-score (within measure)",
+    fill = "Condition",
+    title = "Standardised Distribution of Turn-taking Indices"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 30, hjust = 1, size = 9),
+    strip.text   = element_text(size = 11, face = "bold"),
+    panel.spacing = unit(0.8, "lines"),
+    legend.position = "top"
+  )
+ggsave("distribution_zscore_all.png", path = "/Users/moanason/Downloads/Data_ANA/Fig")
+```
