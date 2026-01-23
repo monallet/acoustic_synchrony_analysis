@@ -166,3 +166,8 @@ https://timmahrt.github.io/praatIO/
 
 pyannote.audio tutorials
 https://pyannote.github.io/pyannote-audio/
+
+```
+
+## Author
+This repository was created for the Master's thesis study, originally by Moana J. Chen, depot on 21.01.2026.
